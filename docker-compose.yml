@@ -1,0 +1,292 @@
+# Базовая конфигурация — локальная разработка: HTTP на *.localhost, без TLS.
+# Прод поднимается оверлеем:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+
+name: tgshop
+
+x-backend-env: &backend-env
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  # Адреса backing-сервисов собираются из отдельных host/port/креды/TLS.
+  # Дефолты указывают на локальные контейнеры (db, cache, mq, storage) — обычный
+  # `docker compose up` работает без правок. Чтобы подключить managed-сервис
+  # (облачный PostgreSQL, Redis, RabbitMQ, S3), достаточно задать его HOST/PORT
+  # и креды в .env; Go-сервисы ходят наружу через сеть edge. Локальный контейнер
+  # при этом не нужен — см. комментарий про managed в .env.example.
+  DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST:-db}:${POSTGRES_PORT:-5432}/${POSTGRES_DB}?sslmode=${POSTGRES_SSLMODE:-disable}
+  REDIS_URL: ${REDIS_SCHEME:-redis}://:${REDIS_PASSWORD}@${REDIS_HOST:-cache}:${REDIS_PORT:-6379}/${REDIS_DB:-0}
+  RABBITMQ_URL: ${RABBITMQ_SCHEME:-amqp}://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@${RABBITMQ_HOST:-mq}:${RABBITMQ_PORT:-5672}/${RABBITMQ_VHOST}
+  # Внутренний адрес — для серверных операций (создание бакета, удаление объектов).
+  # Для облачного S3 (AWS, Yandex Object Storage) укажи полный endpoint в S3_ENDPOINT.
+  S3_ENDPOINT: ${S3_ENDPOINT:-http://storage:9000}
+  S3_REGION: ${S3_REGION:-us-east-1}
+  # MinIO и совместимые требуют path-style; для «настоящего» AWS S3 ставь false.
+  S3_USE_PATH_STYLE: ${S3_USE_PATH_STYLE:-true}
+  # Публичный адрес — для ссылок на картинки и подписи presigned URL.
+  # Подпись S3 включает Host, поэтому presign обязан считаться от публичного адреса,
+  # иначе браузер получит SignatureDoesNotMatch.
+  S3_PUBLIC_URL: http://${MEDIA_HOST:-media.${DOMAIN}}
+  S3_ACCESS_KEY: ${MINIO_ROOT_USER}
+  S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+  S3_BUCKET: ${MINIO_BUCKET}
+  BOT_TOKEN: ${BOT_TOKEN}
+  BOT_WEBHOOK_SECRET: ${BOT_WEBHOOK_SECRET}
+  JWT_SECRET: ${JWT_SECRET}
+  PUBLIC_URL: http://${SHOP_HOST:-${DOMAIN}}
+
+x-backend-deps: &backend-deps
+  db:
+    condition: service_healthy
+  cache:
+    condition: service_healthy
+  mq:
+    condition: service_healthy
+  storage:
+    condition: service_healthy
+
+services:
+  # --- Edge ---------------------------------------------------------------
+  proxy:
+    image: traefik:v3.3
+    restart: unless-stopped
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=tgshop_edge
+      - --entrypoints.web.address=:80
+      # Метрики на отдельном entrypoint, наружу не публикуются: их видит только Prometheus
+      - --entrypoints.metrics.address=:8082
+      - --metrics.prometheus=true
+      - --metrics.prometheus.entrypoint=metrics
+      - --accesslog=true
+      - --accesslog.format=json
+      - --log.level=INFO
+    ports:
+      - "80:80"
+    volumes:
+      # read-only: Traefik только читает список контейнеров
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [edge]
+
+  # --- Приложение ---------------------------------------------------------
+  # Go-сервисы стоят в edge не ради внешнего доступа (его даёт только Traefik
+  # по labels), а ради исходящего трафика: Bot API и платёжный провайдер.
+  # Сеть data закрыта от интернета, наружу из неё не выйти.
+  api:
+    build:
+      context: ./backend
+      target: api
+    restart: unless-stopped
+    environment: *backend-env
+    depends_on: *backend-deps
+    networks: [edge, data]
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.api.rule=Host(`${SHOP_HOST:-${DOMAIN}}`) && PathPrefix(`/api`)
+      - traefik.http.routers.api.entrypoints=web
+      - traefik.http.services.api.loadbalancer.server.port=8080
+
+  bot:
+    build:
+      context: ./backend
+      target: bot
+    restart: unless-stopped
+    environment: *backend-env
+    depends_on: *backend-deps
+    networks: [edge, data]
+    labels:
+      - traefik.enable=true
+      # Секрет в пути вебхука: посторонние не должны знать его адрес
+      - traefik.http.routers.bot.rule=Host(`${SHOP_HOST:-${DOMAIN}}`) && PathPrefix(`/tg/${BOT_WEBHOOK_SECRET}`)
+      - traefik.http.routers.bot.entrypoints=web
+      - traefik.http.services.bot.loadbalancer.server.port=8081
+
+  worker:
+    build:
+      context: ./backend
+      target: worker
+    restart: unless-stopped
+    environment: *backend-env
+    depends_on: *backend-deps
+    # Ни портов, ни traefik-labels: снаружи недостижим
+    networks: [edge, data]
+
+  web:
+    build:
+      context: ./frontend/web
+    restart: unless-stopped
+    networks: [edge]
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.web.rule=Host(`${SHOP_HOST:-${DOMAIN}}`)
+      - traefik.http.routers.web.entrypoints=web
+      - traefik.http.services.web.loadbalancer.server.port=80
+
+  admin:
+    build:
+      context: ./frontend/admin
+    restart: unless-stopped
+    networks: [edge]
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.admin.rule=Host(`${ADMIN_HOST:-admin.${DOMAIN}}`)
+      - traefik.http.routers.admin.entrypoints=web
+      - traefik.http.services.admin.loadbalancer.server.port=80
+
+  # --- Данные -------------------------------------------------------------
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks: [data]
+
+  cache:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD}", "--appendonly", "yes"]
+    volumes:
+      - cache-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    networks: [data]
+
+  mq:
+    image: rabbitmq:4-management-alpine
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
+    # Плагин метрик отдаёт /metrics на :15692 для Prometheus
+    command: >
+      sh -c "rabbitmq-plugins enable --offline rabbitmq_prometheus && exec rabbitmq-server"
+    volumes:
+      - mq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+    networks: [data]
+
+  # Единственный сервис данных, видимый снаружи: картинки товаров и новостей
+  # должен грузить браузер покупателя. Наружу отдаётся только S3-порт (9000),
+  # консоль администрирования (9001) остаётся внутри.
+  storage:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      # MinIO должен знать свой публичный адрес, чтобы корректно проверять подписи
+      MINIO_SERVER_URL: http://${MEDIA_HOST:-media.${DOMAIN}}
+    volumes:
+      - storage-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [edge, data]
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.storage.rule=Host(`${MEDIA_HOST:-media.${DOMAIN}}`)
+      - traefik.http.routers.storage.entrypoints=web
+      - traefik.http.services.storage.loadbalancer.server.port=9000
+
+  # Одноразовый init: создаёт бакет, открывает его на чтение и завершается.
+  # Чтение публичное (картинки в карточках), запись — только по presigned URL.
+  storage-init:
+    image: minio/mc:latest
+    depends_on:
+      storage:
+        condition: service_healthy
+    entrypoint: >
+      sh -c "
+      mc alias set local http://storage:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD} &&
+      mc mb --ignore-existing local/${MINIO_BUCKET} &&
+      mc anonymous set download local/${MINIO_BUCKET}
+      "
+    restart: "no"
+    networks: [data]
+
+  # --- Наблюдаемость ------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=15d
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    networks: [edge, data]
+
+  loki:
+    image: grafana/loki:3.3.2
+    restart: unless-stopped
+    command: ["-config.file=/etc/loki/local-config.yaml"]
+    volumes:
+      - loki-data:/loki
+    networks: [data]
+
+  promtail:
+    image: grafana/promtail:3.3.2
+    restart: unless-stopped
+    command: ["-config.file=/etc/promtail/promtail.yml"]
+    volumes:
+      - ./infra/promtail/promtail.yml:/etc/promtail/promtail.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+    depends_on: [loki]
+    networks: [data]
+
+  grafana:
+    image: grafana/grafana:11.5.1
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SERVER_ROOT_URL: http://${GRAFANA_HOST:-grafana.${DOMAIN}}
+    volumes:
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    depends_on: [prometheus, loki]
+    networks: [edge, data]
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.grafana.rule=Host(`${GRAFANA_HOST:-grafana.${DOMAIN}}`)
+      - traefik.http.routers.grafana.entrypoints=web
+      - traefik.http.services.grafana.loadbalancer.server.port=3000
+
+networks:
+  # Сеть, к которой подключён Traefik. Публикует наружу только он (ports: 80).
+  edge:
+    name: tgshop_edge
+  # Закрыта от интернета: db, cache, mq, storage наружу не ходят и недостижимы.
+  data:
+    name: tgshop_data
+    internal: true
+
+volumes:
+  db-data:
+  cache-data:
+  mq-data:
+  storage-data:
+  prometheus-data:
+  loki-data:
+  grafana-data:

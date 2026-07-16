@@ -1,0 +1,35 @@
+# Локальные удобства для разработки. Compose подхватывает этот файл АВТОМАТИЧЕСКИ
+# при `docker compose up` — специально указывать его не нужно.
+#
+# В прод он не попадает: там файлы перечисляются явно
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+# а явный список -f отключает автоподхват override.
+#
+# Что делает: пробрасывает служебные порты инфраструктуры на localhost.
+# Сеть data закрыта (internal: true), из неё порты на хост не публикуются —
+# поэтому сервисы дополнительно подключаются к обычной bridge-сети devnet.
+
+services:
+  db:
+    networks: [data, devnet]
+    ports:
+      - "5432:5432" # psql / DBeaver
+
+  cache:
+    networks: [data, devnet]
+    ports:
+      - "6379:6379" # redis-cli
+
+  mq:
+    networks: [data, devnet]
+    ports:
+      - "15672:15672" # RabbitMQ Management: очереди, DLQ, ретраи
+
+  storage:
+    networks: [edge, data, devnet]
+    ports:
+      - "9001:9001" # Консоль MinIO: залитые картинки
+
+networks:
+  devnet:
+    name: tgshop_devnet

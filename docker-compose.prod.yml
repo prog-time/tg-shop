@@ -1,0 +1,80 @@
+# Прод-оверлей: TLS через Let's Encrypt, редирект HTTP → HTTPS.
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# Требует в .env: DOMAIN=example.com и ACME_EMAIL=you@example.com
+# DNS-записи всех хостов (по умолчанию $DOMAIN, admin.$DOMAIN, grafana.$DOMAIN) должны указывать на сервер.
+
+services:
+  proxy:
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=tgshop_edge
+      - --entrypoints.web.address=:80
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+      - --entrypoints.websecure.address=:443
+      - --certificatesresolvers.le.acme.email=${ACME_EMAIL}
+      - --certificatesresolvers.le.acme.storage=/letsencrypt/acme.json
+      - --certificatesresolvers.le.acme.tlschallenge=true
+      - --entrypoints.metrics.address=:8082
+      - --metrics.prometheus=true
+      - --metrics.prometheus.entrypoint=metrics
+      - --accesslog=true
+      - --accesslog.format=json
+      - --log.level=INFO
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./infra/letsencrypt:/letsencrypt
+
+  api:
+    environment:
+      PUBLIC_URL: https://${SHOP_HOST:-${DOMAIN}}
+      S3_PUBLIC_URL: https://${MEDIA_HOST:-media.${DOMAIN}}
+    labels:
+      - traefik.http.routers.api.entrypoints=websecure
+      - traefik.http.routers.api.tls.certresolver=le
+
+  bot:
+    environment:
+      PUBLIC_URL: https://${SHOP_HOST:-${DOMAIN}}
+      S3_PUBLIC_URL: https://${MEDIA_HOST:-media.${DOMAIN}}
+    labels:
+      - traefik.http.routers.bot.entrypoints=websecure
+      - traefik.http.routers.bot.tls.certresolver=le
+
+  worker:
+    environment:
+      PUBLIC_URL: https://${SHOP_HOST:-${DOMAIN}}
+      S3_PUBLIC_URL: https://${MEDIA_HOST:-media.${DOMAIN}}
+
+  web:
+    labels:
+      - traefik.http.routers.web.entrypoints=websecure
+      - traefik.http.routers.web.tls.certresolver=le
+
+  storage:
+    environment:
+      MINIO_SERVER_URL: https://${MEDIA_HOST:-media.${DOMAIN}}
+    labels:
+      - traefik.http.routers.storage.entrypoints=websecure
+      - traefik.http.routers.storage.tls.certresolver=le
+
+  admin:
+    labels:
+      - traefik.http.routers.admin.entrypoints=websecure
+      - traefik.http.routers.admin.tls.certresolver=le
+
+  grafana:
+    environment:
+      GF_SERVER_ROOT_URL: https://${GRAFANA_HOST:-grafana.${DOMAIN}}
+    labels:
+      - traefik.http.routers.grafana.entrypoints=websecure
+      - traefik.http.routers.grafana.tls.certresolver=le
+      # Grafana не должна быть открыта миру: basic-auth поверх её собственного логина.
+      # Хэш: htpasswd -nb admin '<пароль>' | sed -e s/\$/\$\$/g
+      - traefik.http.routers.grafana.middlewares=grafana-auth
+      - traefik.http.middlewares.grafana-auth.basicauth.users=${GRAFANA_BASIC_AUTH}
