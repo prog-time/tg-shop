@@ -1,0 +1,3629 @@
+openapi: 3.1.0
+
+info:
+  title: Telegram Shop API
+  version: 0.1.0
+  description: |
+    Pre-implementation REST contract for the tg-shop Go backend (`api` entrypoint).
+
+    This specification is the **design artifact** produced by TASK-20260715-design-backend-rest-api,
+    derived from `docs/architecture.md` (Level 3 — Components of Backend API) and `docs/adr/*.md`.
+    No backend code exists yet; this document is the contract that later implementation must satisfy.
+
+    ### Source of truth
+    `docs/architecture.md` remains the single source of truth for the system architecture. If anything
+    in this spec conflicts with it, `docs/architecture.md` wins and this file must be corrected.
+
+    ### Two authentication mechanisms (by design, not an oversight)
+    - **Storefront (витрина)** — Telegram Web App `initData`, verified server-side only. See the
+      `initData` security scheme.
+    - **Admin panel (админка)** — a JWT issued by `POST /admin/auth/login`. See the `adminJWT`
+      security scheme. Storefront and admin intentionally use different mechanisms
+      (see `docs/architecture.md`, Security rules).
+
+    ### What is deliberately absent from this contract
+    - Any endpoint that publishes to RabbitMQ or reads/writes the `outbox` table. The transactional
+      outbox (ADR-004) is an internal implementation detail of the `orders`/`payment` domain
+      operations; it is never part of the public REST surface.
+    - Any client-side `initData` signature verification endpoint. Verification happens exclusively
+      inside `api`.
+    - Hard-delete endpoints for dictionary values and field definitions — per ADR-002 they are
+      archived/deprecated, never deleted.
+
+    ### Conventions
+    - All paths are versioned under `/api/v1` (see `servers`).
+    - All responses use the envelope pattern: `{ "data": ... }` for single resources,
+      `{ "data": [...], "meta": {...} }` for lists. No endpoint returns a raw array.
+    - All identifiers are 64-bit integers (`format: int64`), matching the indicative `bigint` primary
+      keys in `docs/database.md`. This is a judgment call — the schema explicitly labels its key
+      types as not yet frozen; if the team switches to UUIDs during implementation, only the `format`
+      of the `id` fields changes, not their JSON position, so this is a low-risk choice to fix now.
+    - Money is a decimal string with exactly two fraction digits (e.g. `"1999.00"`), matching the
+      `numeric` column type used throughout `docs/database.md`. The shop is single-currency (no
+      `currency` column exists on any monetary table), so `Money` does not carry a currency code;
+      the operating currency is a shop-wide setting (`GET /admin/settings`). This is the pagination/
+      money judgment call required by the task brief.
+    - Pagination is offset-based: `page` (default 1) / `limit` (default 20, max 100), with a `meta`
+      block carrying `page`, `limit`, `total`, `total_pages`.
+    - Sorting: `sort` query parameter, comma-separated fields, `-` prefix for descending.
+    - Filtering: plain query parameters named after the field; range filters use `_gte`/`_lte`;
+      multi-value filters repeat the parameter. Facet filtering on `/products` uses a repeatable
+      `facet` parameter (see its parameter description) because facet keys are dynamic
+      (`field_definition_id:dictionary_value_id` pairs), not a fixed field name.
+    - Errors use one shared envelope everywhere: `{ "error": { "code", "message", "details": [...] } }`.
+
+servers:
+  - url: /api/v1
+    description: Reverse-proxied path on the shared storefront/API host (Traefik routes
+      `$DOMAIN/api` to the `api` container; storefront and API share one origin by design).
+
+tags:
+  - name: auth
+    description: >
+      Admin (staff) authentication — email/password login, refresh, logout, current session — and
+      the storefront's own identity check (`GET /me`), which relies on `initData` rather than a
+      login flow. Maps to the Auth Module in `docs/architecture.md`.
+  - name: catalog
+    description: >
+      Read-only storefront browsing of categories, products, and facet filters. Maps to the Catalog
+      Module. `products.attributes` are always resolved from dictionary-value ids to display labels
+      in responses — clients never see raw ids without a label.
+  - name: content
+    description: >
+      Read-only storefront access to blog/news posts. Maps to the Content Module. Managing posts,
+      dictionaries, dictionary values, and field definitions is an `admin`-tag concern — this tag is
+      customer reads only.
+  - name: cart
+    description: >
+      Customer's shopping cart, stored in Redis (never PostgreSQL). Maps to the Cart Module. Prices
+      shown here are live catalog prices; they are only frozen into a snapshot at checkout
+      (`POST /orders`).
+  - name: delivery
+    description: >
+      Storefront listing of delivery methods and cost quoting. Maps to the Delivery Module.
+  - name: orders
+    description: >
+      Customer checkout and order history. Checkout (`POST /orders`) is one atomic operation:
+      the server assembles the order from the cart, decrements stock under a row lock, computes
+      delivery cost, snapshots item/delivery/payment-method details, and persists the order —
+      exactly as required by `docs/architecture.md` (Orders Module). Order responses never
+      re-resolve snapshot fields against the live catalog.
+  - name: payment
+    description: >
+      Payment initiation, status, and the public provider webhook. Maps to the Payment Module. The
+      webhook is the only public (non-authenticated-by-user) endpoint in this contract; it is
+      authenticated by provider signature and is idempotent on `provider_payment_id`.
+  - name: media
+    description: >
+      Presigned-upload issuance and upload confirmation for the Media Module. File bytes are never
+      proxied through `api` — clients upload directly to MinIO using the presigned URL. Upload is
+      admin-only (product images and post covers are staff-managed content).
+  - name: admin
+    description: >
+      Staff-only surface (Admin Module). Every admin operation calls the same domain services the
+      storefront uses (no privileged direct-DB shortcuts), and documents the RBAC role(s) required
+      (`admin`, `order_manager`, `content_manager`) in its description. Dictionary values and field
+      definitions are archived/deprecated, never hard-deleted, per ADR-002.
+
+security:
+  - initData: []
+
+paths:
+  # ---------------------------------------------------------------- auth --
+  /admin/auth/login:
+    post:
+      operationId: adminLogin
+      tags: [auth]
+      summary: Staff login
+      description: |
+        Exchanges staff email/password for an access/refresh JWT pair. No RBAC role required (this
+        endpoint authenticates staff identity itself).
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminLoginRequest'
+      responses:
+        '200':
+          description: Authenticated.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: object
+                    required: [tokens, admin_user]
+                    properties:
+                      tokens:
+                        $ref: '#/components/schemas/TokenPair'
+                      admin_user:
+                        $ref: '#/components/schemas/AdminUser'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /admin/auth/refresh:
+    post:
+      operationId: adminRefresh
+      tags: [auth]
+      summary: Refresh admin session
+      description: Exchanges a valid refresh token for a new access/refresh token pair (rotation).
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshRequest'
+      responses:
+        '200':
+          description: New token pair issued.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/TokenPair'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /admin/auth/logout:
+    post:
+      operationId: adminLogout
+      tags: [auth]
+      summary: Staff logout
+      description: Revokes the presented refresh token (and, at implementation's discretion, the
+        current access token) so the session can no longer be refreshed.
+      security:
+        - adminJWT: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshRequest'
+      responses:
+        '204':
+          description: Logged out.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /admin/auth/me:
+    get:
+      operationId: getAdminMe
+      tags: [auth]
+      summary: Current staff session
+      description: Returns the authenticated staff account and role.
+      security:
+        - adminJWT: []
+      responses:
+        '200':
+          description: Current admin user.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/AdminUser'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /me:
+    get:
+      operationId: getMe
+      tags: [auth]
+      summary: Current storefront customer
+      description: >
+        Returns (creating on first sight, if necessary) the customer record derived from the
+        verified Telegram `initData`. There is no separate storefront login — identity is entirely
+        `initData`-driven.
+      responses:
+        '200':
+          description: Current customer.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Customer'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  # ------------------------------------------------------------- catalog --
+  /categories:
+    get:
+      operationId: listCategories
+      tags: [catalog]
+      summary: List categories
+      description: Flat list of active categories (use `parent_id` to walk the tree client-side).
+      parameters:
+        - name: parent_id
+          in: query
+          description: Filter to direct children of this category id. Use `null` (literal string)
+            to list only root categories.
+          schema:
+            type: string
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+        - name: sort
+          in: query
+          description: 'Comma-separated fields, `-` prefix for descending. Allowed: `position`, `name`.'
+          schema:
+            type: string
+            default: position
+          example: position
+      responses:
+        '200':
+          description: Category list.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Category' }
+                  meta: { $ref: '#/components/schemas/PaginationMeta' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /categories/{categoryId}:
+    get:
+      operationId: getCategory
+      tags: [catalog]
+      summary: Get a category
+      parameters:
+        - $ref: '#/components/parameters/CategoryIdOrSlug'
+      responses:
+        '200':
+          description: Category.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Category' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /categories/{categoryId}/facets:
+    get:
+      operationId: getCategoryFacets
+      tags: [catalog]
+      summary: Available filters for a category
+      description: >
+        Aggregates `product_facets` for every active product in this category into the set of
+        filterable dictionary fields and their values (with counts), plus the observed price range.
+        The storefront uses this to render the filter sidebar before the customer picks any filter.
+      parameters:
+        - $ref: '#/components/parameters/CategoryIdOrSlug'
+      responses:
+        '200':
+          description: Facets available for this category.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: object
+                    required: [facets, price_range]
+                    properties:
+                      facets:
+                        type: array
+                        items: { $ref: '#/components/schemas/Facet' }
+                      price_range:
+                        type: object
+                        required: [min, max]
+                        properties:
+                          min: { $ref: '#/components/schemas/Money' }
+                          max: { $ref: '#/components/schemas/Money' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /products:
+    get:
+      operationId: listProducts
+      tags: [catalog]
+      summary: List / filter products
+      description: >
+        Filtering and sorting run against `product_facets` and indexed columns — never a JSONB scan
+        of `attributes` — per ADR-002.
+      parameters:
+        - name: category_id
+          in: query
+          schema: { type: integer, format: int64 }
+        - name: q
+          in: query
+          description: Free-text search over product name.
+          schema: { type: string }
+        - name: price_gte
+          in: query
+          description: Minimum price (inclusive), same decimal-string format as `Money`.
+          schema: { type: string, pattern: '^\d+(\.\d{1,2})?$' }
+        - name: price_lte
+          in: query
+          description: Maximum price (inclusive), same decimal-string format as `Money`.
+          schema: { type: string, pattern: '^\d+(\.\d{1,2})?$' }
+        - name: in_stock
+          in: query
+          description: 'If `true`, only products with `stock > 0`.'
+          schema: { type: boolean }
+        - name: facet
+          in: query
+          description: >
+            Repeatable. Each value is `"<field_definition_id>:<dictionary_value_id>"`. Multiple
+            values for the *same* `field_definition_id` are OR'd (e.g. size=S or size=M); values for
+            *different* `field_definition_id`s are AND'd. Example: `facet=12:101&facet=12:102&facet=15:220`
+            means `(size=101 OR size=102) AND (color=220)`.
+          style: form
+          explode: true
+          schema:
+            type: array
+            items: { type: string, pattern: '^\d+:\d+$' }
+          example: ['12:101', '15:220']
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+        - name: sort
+          in: query
+          description: 'Comma-separated fields, `-` prefix for descending. Allowed: `price`, `name`, `created_at`.'
+          schema:
+            type: string
+            default: '-created_at'
+          example: price
+        - $ref: '#/components/parameters/Fields'
+      responses:
+        '200':
+          description: Product list.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/ProductListItem' }
+                  meta: { $ref: '#/components/schemas/PaginationMeta' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /products/{productId}:
+    get:
+      operationId: getProduct
+      tags: [catalog]
+      summary: Get a product
+      description: >
+        `attributes` are resolved: every dictionary-backed field returns the current label text
+        alongside the id, never a bare id. Archived dictionary values remain visible here if a
+        product still references them (per ADR-002), the archived flag is set to `true`.
+      parameters:
+        - $ref: '#/components/parameters/ProductIdOrSlug'
+      responses:
+        '200':
+          description: Product.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Product' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  # ------------------------------------------------------------- content --
+  /posts:
+    get:
+      operationId: listPosts
+      tags: [content]
+      summary: List published posts
+      description: Only posts with a non-null `published_at` in the past are returned (drafts are
+        an `admin`-tag concern).
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+        - name: sort
+          in: query
+          description: 'Comma-separated fields, `-` prefix for descending. Allowed: `published_at`.'
+          schema: { type: string, default: '-published_at' }
+      responses:
+        '200':
+          description: Post list.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Post' }
+                  meta: { $ref: '#/components/schemas/PaginationMeta' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /posts/{postId}:
+    get:
+      operationId: getPost
+      tags: [content]
+      summary: Get a published post
+      parameters:
+        - $ref: '#/components/parameters/PostIdOrSlug'
+      responses:
+        '200':
+          description: Post.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Post' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  # ---------------------------------------------------------------- cart --
+  /cart:
+    get:
+      operationId: getCart
+      tags: [cart]
+      summary: Get the current customer's cart
+      description: Reads directly from Redis, keyed by the authenticated customer. Prices are
+        live catalog prices, refreshed on every read (not frozen — freezing happens at checkout).
+      responses:
+        '200':
+          description: Cart (empty cart is a valid `200`, not a `404`).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Cart' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    delete:
+      operationId: clearCart
+      tags: [cart]
+      summary: Clear the cart
+      responses:
+        '204':
+          description: Cart cleared.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /cart/items:
+    post:
+      operationId: addCartItem
+      tags: [cart]
+      summary: Add an item to the cart
+      description: If the product is already in the cart, `quantity` is added to the existing line
+        (not replaced) — use `PATCH /cart/items/{productId}` to set an absolute quantity.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddCartItemRequest'
+      responses:
+        '200':
+          description: Updated cart.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Cart' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Requested quantity exceeds available stock.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /cart/items/{productId}:
+    patch:
+      operationId: updateCartItem
+      tags: [cart]
+      summary: Set an item's quantity
+      description: >
+        Sets the line to exactly `quantity` (not additive). A quantity of zero is rejected — use
+        `DELETE` to remove the line.
+      parameters:
+        - name: productId
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateCartItemRequest'
+      responses:
+        '200':
+          description: Updated cart.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Cart' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Requested quantity exceeds available stock.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    delete:
+      operationId: removeCartItem
+      tags: [cart]
+      summary: Remove an item from the cart
+      parameters:
+        - name: productId
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      responses:
+        '200':
+          description: Updated cart.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Cart' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  # ------------------------------------------------------------ delivery --
+  /delivery-methods:
+    get:
+      operationId: listDeliveryMethods
+      tags: [delivery]
+      summary: List active delivery methods
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Delivery method list.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/DeliveryMethod' }
+                  meta: { $ref: '#/components/schemas/PaginationMeta' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /delivery-quotes:
+    post:
+      operationId: createDeliveryQuote
+      tags: [delivery]
+      summary: Quote delivery cost for the current cart and an address
+      description: >
+        Computes cost for the authenticated customer's current cart contents (weight/total-driven
+        rules live in `delivery_methods.config`) delivered to the given address. Does not persist
+        anything — it is recomputed for real at checkout and frozen into the order snapshot then.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeliveryQuoteRequest'
+      responses:
+        '200':
+          description: Delivery quote.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/DeliveryQuote' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Cart is empty — nothing to quote.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  # -------------------------------------------------------------- orders --
+  /orders:
+    post:
+      operationId: createOrder
+      tags: [orders]
+      summary: Checkout — create an order from the current cart
+      description: >
+        Single atomic operation (see Orders Module in `docs/architecture.md`): assembles line items
+        from the customer's cart, locks and decrements product stock, computes the delivery quote,
+        snapshots item/delivery/payment-method details onto the order, persists it, and clears the
+        cart. The domain event that eventually triggers a customer notification is written to the
+        `outbox` table in the same transaction — that write is an internal detail and is not part
+        of this response.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOrderRequest'
+      responses:
+        '201':
+          description: Order created.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Order' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Cart is empty, or stock is insufficient for one or more lines.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    get:
+      operationId: listMyOrders
+      tags: [orders]
+      summary: List my orders
+      parameters:
+        - name: status
+          in: query
+          description: Repeatable.
+          style: form
+          explode: true
+          schema:
+            type: array
+            items: { $ref: '#/components/schemas/OrderStatus' }
+        - name: created_at_gte
+          in: query
+          schema: { type: string, format: date-time }
+        - name: created_at_lte
+          in: query
+          schema: { type: string, format: date-time }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+        - name: sort
+          in: query
+          description: 'Comma-separated fields, `-` prefix for descending. Allowed: `created_at`, `total`.'
+          schema: { type: string, default: '-created_at' }
+      responses:
+        '200':
+          description: Order list.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Order' }
+                  meta: { $ref: '#/components/schemas/PaginationMeta' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /orders/{orderId}:
+    get:
+      operationId: getMyOrder
+      tags: [orders]
+      summary: Get one of my orders
+      parameters:
+        - name: orderId
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      responses:
+        '200':
+          description: Order.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Order' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  # ------------------------------------------------------------- payment --
+  /orders/{orderId}/payments:
+    post:
+      operationId: initiatePayment
+      tags: [payment]
+      summary: Initiate (or re-initiate) payment for an order
+      description: >
+        Creates a `Payment` for the order and returns a provider `confirmation_url` for the
+        customer to complete payment. Checkout (`POST /orders`) already initiates the first payment
+        automatically using the order's `payment_method_id`; call this endpoint again only to retry
+        after a failed/expired attempt (e.g. `confirmation_url` expired) or to switch
+        `payment_method_id`. Requesting a new payment while a `pending` one exists for the same
+        order returns the existing pending `Payment` rather than creating a duplicate.
+      parameters:
+        - name: orderId
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InitiatePaymentRequest'
+      responses:
+        '201':
+          description: Payment created.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Payment' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Order is not in a payable state (e.g. already `paid` or `cancelled`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /payments/{paymentId}:
+    get:
+      operationId: getPayment
+      tags: [payment]
+      summary: Get payment status
+      description: Accessible to the owning customer (via `initData`) or any authenticated staff
+        member (via `adminJWT`); the handler still scopes customer access to their own orders.
+      security:
+        - initData: []
+        - adminJWT: []
+      parameters:
+        - name: paymentId
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      responses:
+        '200':
+          description: Payment.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Payment' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /payments/webhook/{provider}:
+    post:
+      operationId: paymentWebhook
+      tags: [payment]
+      summary: Payment provider callback
+      description: >
+        The only public endpoint in this contract. Authenticated by the provider's signature
+        (see the `providerSignature` security scheme), never by `initData`/`adminJWT`. Idempotent on
+        `provider_payment_id`: replays of the same callback must not change state twice or notify
+        the customer twice. Payload shape is provider-specific (Telegram Payments / YooKassa /
+        Stripe per `docs/architecture.md`); `PaymentWebhookPayload` below is the normalized envelope
+        this contract commits to — mapping each provider's native payload into it is an
+        implementation detail behind this endpoint, not a v1 concern.
+      security:
+        - providerSignature: []
+      parameters:
+        - name: provider
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [telegram, yookassa, stripe]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PaymentWebhookPayload'
+      responses:
+        '200':
+          description: Callback accepted (including "already processed" replays — always ack with
+            `200` so the provider does not retry a callback we've already handled).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: object
+                    required: [received]
+                    properties:
+                      received: { type: boolean, const: true }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401':
+          description: Missing or invalid provider signature.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  # ---------------------------------------------------------------- media --
+  /media/presigned-uploads:
+    post:
+      operationId: createPresignedUpload
+      tags: [media]
+      summary: Request a presigned upload URL
+      description: >
+        Issues a time-limited presigned PUT URL for direct browser-to-MinIO upload. File bytes never
+        pass through `api`. The URL is signed against the public S3 endpoint
+        (`S3_PUBLIC_URL`), not the internal one, per `docs/architecture.md`. Staff-only: product
+        images and post covers are managed content.
+      security:
+        - adminJWT: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PresignUploadRequest'
+      responses:
+        '201':
+          description: Presigned upload issued.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/PresignedUpload' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422':
+          description: Rejected `content_type` or `size_bytes` over the allowed limit for `purpose`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /media:
+    post:
+      operationId: confirmMedia
+      tags: [media]
+      summary: Confirm an uploaded object and register it
+      description: Called after the client successfully PUTs the file to the presigned URL. Creates
+        the `media` row; the object is not usable as a product image / post cover until this step
+        completes.
+      security:
+        - adminJWT: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConfirmMediaRequest'
+      responses:
+        '201':
+          description: Media registered.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Media' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: '`object_key` was never issued by `POST /media/presigned-uploads`, or the
+            object is not present in the bucket yet.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: '`object_key` already confirmed as a `Media` record.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /media/{mediaId}:
+    get:
+      operationId: getMedia
+      tags: [media]
+      summary: Get media metadata
+      security:
+        - adminJWT: []
+      parameters:
+        - name: mediaId
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      responses:
+        '200':
+          description: Media.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Media' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    delete:
+      operationId: deleteMedia
+      tags: [media]
+      summary: Delete media
+      description: Hard delete (media is not subject to the archive-don't-delete invariant, which
+        applies specifically to dictionary values and field definitions). Blocked with `409` while
+        the object is still referenced by a product image or post cover.
+      security:
+        - adminJWT: []
+      parameters:
+        - name: mediaId
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      responses:
+        '204':
+          description: Deleted.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Still referenced by a product image or post cover.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  # ---------------------------------------------------------------- admin --
+  /admin/products:
+    get:
+      operationId: adminListProducts
+      tags: [admin]
+      summary: List products (staff view)
+      description: 'Required role: `content_manager` or `admin`. Unlike the storefront list, this
+        includes inactive products and returns raw `stock`.'
+      security: [{ adminJWT: [] }]
+      parameters:
+        - name: category_id
+          in: query
+          schema: { type: integer, format: int64 }
+        - name: is_active
+          in: query
+          schema: { type: boolean }
+        - name: q
+          in: query
+          schema: { type: string }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+        - name: sort
+          in: query
+          schema: { type: string, default: '-created_at' }
+        - $ref: '#/components/parameters/Fields'
+      responses:
+        '200':
+          description: Product list.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Product' }
+                  meta: { $ref: '#/components/schemas/PaginationMeta' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    post:
+      operationId: adminCreateProduct
+      tags: [admin]
+      summary: Create a product
+      description: >
+        Required role: `content_manager` or `admin`. `attributes` are validated in Go against
+        `field_definitions` for the given `category_id` — "anything goes in JSONB" is not allowed
+        (ADR-002). `catalog` rebuilds `product_facets` for this product as part of the write.
+      security: [{ adminJWT: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateProductRequest'
+      responses:
+        '201':
+          description: Product created.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Product' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422':
+          description: '`attributes` failed validation against `field_definitions` for the category.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /admin/products/{productId}:
+    get:
+      operationId: adminGetProduct
+      tags: [admin]
+      summary: Get a product (staff view)
+      description: 'Required role: `content_manager` or `admin`.'
+      security: [{ adminJWT: [] }]
+      parameters:
+        - name: productId
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      responses:
+        '200':
+          description: Product.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Product' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    patch:
+      operationId: adminUpdateProduct
+      tags: [admin]
+      summary: Update a product
+      description: 'Required role: `content_manager` or `admin`. Rebuilds `product_facets` when
+        `category_id` or `attributes` change.'
+      security: [{ adminJWT: [] }]
+      parameters:
+        - name: productId
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateProductRequest'
+      responses:
+        '200':
+          description: Updated product.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Product' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    delete:
+      operationId: adminDeleteProduct
+      tags: [admin]
+      summary: Delete a product
+      description: >
+        Required role: `content_manager` or `admin`. Existing `order_items` are unaffected — they
+        hold a frozen snapshot (`name_snapshot`, `price_snapshot`, `attributes_snapshot`) and a
+        nullable `product_id` reference, so deleting the live product never rewrites order history.
+      security: [{ adminJWT: [] }]
+      parameters:
+        - name: productId
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      responses:
+        '204':
+          description: Deleted.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /admin/categories:
+    get:
+      operationId: adminListCategories
+      tags: [admin]
+      summary: List categories (staff view, includes inactive)
+      description: 'Required role: `content_manager` or `admin`.'
+      security: [{ adminJWT: [] }]
+      parameters:
+        - name: parent_id
+          in: query
+          schema: { type: string }
+        - name: is_active
+          in: query
+          schema: { type: boolean }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Category list.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Category' }
+                  meta: { $ref: '#/components/schemas/PaginationMeta' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    post:
+      operationId: adminCreateCategory
+      tags: [admin]
+      summary: Create a category
+      description: 'Required role: `content_manager` or `admin`.'
+      security: [{ adminJWT: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateCategoryRequest'
+      responses:
+        '201':
+          description: Category created.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Category' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /admin/categories/{categoryId}:
+    get:
+      operationId: adminGetCategory
+      tags: [admin]
+      summary: Get a category (staff view)
+      description: 'Required role: `content_manager` or `admin`.'
+      security: [{ adminJWT: [] }]
+      parameters:
+        - name: categoryId
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      responses:
+        '200':
+          description: Category.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Category' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    patch:
+      operationId: adminUpdateCategory
+      tags: [admin]
+      summary: Update a category
+      description: 'Required role: `content_manager` or `admin`.'
+      security: [{ adminJWT: [] }]
+      parameters:
+        - name: categoryId
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateCategoryRequest'
+      responses:
+        '200':
+          description: Updated category.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Category' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    delete:
+      operationId: adminDeleteCategory
+      tags: [admin]
+      summary: Delete a category
+      description: 'Required role: `content_manager` or `admin`. Blocked with `409` while the
+        category still has products or child categories.'
+      security: [{ adminJWT: [] }]
+      parameters:
+        - name: categoryId
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      responses:
+        '204':
+          description: Deleted.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /admin/dictionaries:
+    get:
+      operationId: adminListDictionaries
+      tags: [admin]
+      summary: List dictionaries
+      description: 'Required role: `content_manager` or `admin`.'
+      security: [{ adminJWT: [] }]
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Dictionary list.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Dictionary' }
+                  meta: { $ref: '#/components/schemas/PaginationMeta' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    post:
+      operationId: adminCreateDictionary
+      tags: [admin]
+      summary: Create a dictionary
+      description: 'Required role: `content_manager` or `admin`. Created at runtime, no deploy
+        required (ADR-002).'
+      security: [{ adminJWT: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateDictionaryRequest'
+      responses:
+        '201':
+          description: Dictionary created.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Dictionary' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /admin/dictionaries/{dictionaryId}:
+    get:
+      operationId: adminGetDictionary
+      tags: [admin]
+      summary: Get a dictionary
+      description: 'Required role: `content_manager` or `admin`.'
+      security: [{ adminJWT: [] }]
+      parameters:
+        - name: dictionaryId
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      responses:
+        '200':
+          description: Dictionary.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Dictionary' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    patch:
+      operationId: adminUpdateDictionary
+      tags: [admin]
+      summary: Rename a dictionary
+      description: 'Required role: `content_manager` or `admin`. `code` is immutable after creation
+        (it is the stable machine key referenced by `field_definitions.dictionary_id` — actually
+        `dictionary_id` is a stable numeric FK, but `code` is still kept immutable to avoid breaking
+        any tooling or exports keyed on it).'
+      security: [{ adminJWT: [] }]
+      parameters:
+        - name: dictionaryId
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateDictionaryRequest'
+      responses:
+        '200':
+          description: Updated dictionary.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Dictionary' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /admin/dictionaries/{dictionaryId}/values:
+    get:
+      operationId: adminListDictionaryValues
+      tags: [admin]
+      summary: List values of a dictionary
+      description: 'Required role: `content_manager` or `admin`. Includes archived values (filter
+        with `is_archived=false` to hide them).'
+      security: [{ adminJWT: [] }]
+      parameters:
+        - name: dictionaryId
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+        - name: is_archived
+          in: query
+          schema: { type: boolean }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Dictionary value list.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/DictionaryValue' }
+                  meta: { $ref: '#/components/schemas/PaginationMeta' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    post:
+      operationId: adminCreateDictionaryValue
+      tags: [admin]
+      summary: Add a value to a dictionary
+      description: 'Required role: `content_manager` or `admin`. This is the operation managers use
+        constantly at runtime to extend a dictionary — no deploy involved (ADR-002).'
+      security: [{ adminJWT: [] }]
+      parameters:
+        - name: dictionaryId
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateDictionaryValueRequest'
+      responses:
+        '201':
+          description: Value created.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/DictionaryValue' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /admin/dictionary-values/{valueId}:
+    get:
+      operationId: adminGetDictionaryValue
+      tags: [admin]
+      summary: Get a dictionary value
+      description: 'Required role: `content_manager` or `admin`.'
+      security: [{ adminJWT: [] }]
+      parameters:
+        - name: valueId
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      responses:
+        '200':
+          description: Dictionary value.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/DictionaryValue' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    patch:
+      operationId: adminUpdateDictionaryValue
+      tags: [admin]
+      summary: Rename, reorder, or archive a dictionary value
+      description: >
+        Required role: `content_manager` or `admin`. There is **no `DELETE`** for this resource by
+        design: per ADR-002, a value in use is archived (`is_archived: true`), never deleted —
+        archived values are hidden from new-product pickers but still render correctly on the
+        products that already reference them.
+      security: [{ adminJWT: [] }]
+      parameters:
+        - name: valueId
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateDictionaryValueRequest'
+      responses:
+        '200':
+          description: Updated value.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/DictionaryValue' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /admin/field-definitions:
+    get:
+      operationId: adminListFieldDefinitions
+      tags: [admin]
+      summary: List field definitions
+      description: 'Required role: `content_manager` or `admin`.'
+      security: [{ adminJWT: [] }]
+      parameters:
+        - name: category_id
+          in: query
+          schema: { type: integer, format: int64 }
+        - name: is_deprecated
+          in: query
+          schema: { type: boolean }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Field definition list.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/FieldDefinition' }
+                  meta: { $ref: '#/components/schemas/PaginationMeta' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    post:
+      operationId: adminCreateFieldDefinition
+      tags: [admin]
+      summary: Create a field definition
+      description: 'Required role: `content_manager` or `admin`. Adds a characteristic to a
+        category''s product form at runtime (ADR-002); the admin UI renders one component per
+        `type`, no frontend redeploy needed.'
+      security: [{ adminJWT: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateFieldDefinitionRequest'
+      responses:
+        '201':
+          description: Field definition created.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/FieldDefinition' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /admin/field-definitions/{fieldDefinitionId}:
+    get:
+      operationId: adminGetFieldDefinition
+      tags: [admin]
+      summary: Get a field definition
+      description: 'Required role: `content_manager` or `admin`.'
+      security: [{ adminJWT: [] }]
+      parameters:
+        - name: fieldDefinitionId
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      responses:
+        '200':
+          description: Field definition.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/FieldDefinition' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    patch:
+      operationId: adminUpdateFieldDefinition
+      tags: [admin]
+      summary: Update label/validation/ordering, or deprecate a field definition
+      description: >
+        Required role: `content_manager` or `admin`. `category_id`, `code`, `type`, and
+        `dictionary_id` are **immutable** after creation — per ADR-002/`docs/architecture.md`,
+        changing a field's type is forbidden; create a new field and migrate data instead. There is
+        **no `DELETE`**: set `is_deprecated: true` to retire a field without erasing history on
+        products that already carry it in `attributes`.
+      security: [{ adminJWT: [] }]
+      parameters:
+        - name: fieldDefinitionId
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateFieldDefinitionRequest'
+      responses:
+        '200':
+          description: Updated field definition.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/FieldDefinition' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422':
+          description: Attempted to change an immutable field (`category_id`, `code`, `type`,
+            `dictionary_id`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /admin/posts:
+    get:
+      operationId: adminListPosts
+      tags: [admin]
+      summary: List posts, including drafts
+      description: 'Required role: `content_manager` or `admin`.'
+      security: [{ adminJWT: [] }]
+      parameters:
+        - name: published
+          in: query
+          description: 'Filter: `true` published only, `false` drafts only, omit for all.'
+          schema: { type: boolean }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+        - name: sort
+          in: query
+          schema: { type: string, default: '-created_at' }
+      responses:
+        '200':
+          description: Post list.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Post' }
+                  meta: { $ref: '#/components/schemas/PaginationMeta' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    post:
+      operationId: adminCreatePost
+      tags: [admin]
+      summary: Create a post
+      description: 'Required role: `content_manager` or `admin`. Omit `published_at` (or set it in
+        the future) to save as a draft.'
+      security: [{ adminJWT: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreatePostRequest'
+      responses:
+        '201':
+          description: Post created.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Post' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /admin/posts/{postId}:
+    get:
+      operationId: adminGetPost
+      tags: [admin]
+      summary: Get a post (including drafts)
+      description: 'Required role: `content_manager` or `admin`.'
+      security: [{ adminJWT: [] }]
+      parameters:
+        - name: postId
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      responses:
+        '200':
+          description: Post.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Post' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    patch:
+      operationId: adminUpdatePost
+      tags: [admin]
+      summary: Update a post
+      description: 'Required role: `content_manager` or `admin`.'
+      security: [{ adminJWT: [] }]
+      parameters:
+        - name: postId
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdatePostRequest'
+      responses:
+        '200':
+          description: Updated post.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Post' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    delete:
+      operationId: adminDeletePost
+      tags: [admin]
+      summary: Delete a post
+      description: 'Required role: `content_manager` or `admin`.'
+      security: [{ adminJWT: [] }]
+      parameters:
+        - name: postId
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      responses:
+        '204':
+          description: Deleted.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /admin/delivery-methods:
+    get:
+      operationId: adminListDeliveryMethods
+      tags: [admin]
+      summary: List delivery methods (staff view, includes inactive)
+      description: 'Required role: `admin`.'
+      security: [{ adminJWT: [] }]
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Delivery method list.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/DeliveryMethod' }
+                  meta: { $ref: '#/components/schemas/PaginationMeta' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    post:
+      operationId: adminCreateDeliveryMethod
+      tags: [admin]
+      summary: Create a delivery method
+      description: 'Required role: `admin`.'
+      security: [{ adminJWT: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateDeliveryMethodRequest'
+      responses:
+        '201':
+          description: Delivery method created.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/DeliveryMethod' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /admin/delivery-methods/{deliveryMethodId}:
+    get:
+      operationId: adminGetDeliveryMethod
+      tags: [admin]
+      summary: Get a delivery method
+      description: 'Required role: `admin`.'
+      security: [{ adminJWT: [] }]
+      parameters:
+        - name: deliveryMethodId
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      responses:
+        '200':
+          description: Delivery method.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/DeliveryMethod' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    patch:
+      operationId: adminUpdateDeliveryMethod
+      tags: [admin]
+      summary: Update a delivery method
+      description: 'Required role: `admin`.'
+      security: [{ adminJWT: [] }]
+      parameters:
+        - name: deliveryMethodId
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateDeliveryMethodRequest'
+      responses:
+        '200':
+          description: Updated delivery method.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/DeliveryMethod' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    delete:
+      operationId: adminDeleteDeliveryMethod
+      tags: [admin]
+      summary: Delete a delivery method
+      description: 'Required role: `admin`. Blocked with `409` if any order still references it as
+        its live `delivery_method_id` — historic orders keep working via their
+        `delivery_name`/`delivery_price` snapshot fields regardless, since those are copied at
+        checkout, not looked up live.'
+      security: [{ adminJWT: [] }]
+      parameters:
+        - name: deliveryMethodId
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      responses:
+        '204':
+          description: Deleted.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /admin/payment-methods:
+    get:
+      operationId: adminListPaymentMethods
+      tags: [admin]
+      summary: List payment methods (staff view, includes inactive)
+      description: 'Required role: `admin`.'
+      security: [{ adminJWT: [] }]
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Payment method list.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/PaymentMethod' }
+                  meta: { $ref: '#/components/schemas/PaginationMeta' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    post:
+      operationId: adminCreatePaymentMethod
+      tags: [admin]
+      summary: Create a payment method
+      description: 'Required role: `admin`. `provider` identifies which external payment gateway
+        this method routes to (Telegram Payments / YooKassa / Stripe); the provider integration
+        itself is owned exclusively by the Payment Module.'
+      security: [{ adminJWT: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreatePaymentMethodRequest'
+      responses:
+        '201':
+          description: Payment method created.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/PaymentMethod' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /admin/payment-methods/{paymentMethodId}:
+    get:
+      operationId: adminGetPaymentMethod
+      tags: [admin]
+      summary: Get a payment method
+      description: 'Required role: `admin`.'
+      security: [{ adminJWT: [] }]
+      parameters:
+        - name: paymentMethodId
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      responses:
+        '200':
+          description: Payment method.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/PaymentMethod' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    patch:
+      operationId: adminUpdatePaymentMethod
+      tags: [admin]
+      summary: Update a payment method
+      description: 'Required role: `admin`.'
+      security: [{ adminJWT: [] }]
+      parameters:
+        - name: paymentMethodId
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdatePaymentMethodRequest'
+      responses:
+        '200':
+          description: Updated payment method.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/PaymentMethod' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    delete:
+      operationId: adminDeletePaymentMethod
+      tags: [admin]
+      summary: Delete a payment method
+      description: 'Required role: `admin`. Blocked with `409` if any order still references it as
+        its live `payment_method_id` (historic orders are unaffected either way, via
+        `payment_method_name` snapshot).'
+      security: [{ adminJWT: [] }]
+      parameters:
+        - name: paymentMethodId
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      responses:
+        '204':
+          description: Deleted.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /admin/orders:
+    get:
+      operationId: adminListOrders
+      tags: [admin]
+      summary: List all orders
+      description: 'Required role: `order_manager` or `admin`.'
+      security: [{ adminJWT: [] }]
+      parameters:
+        - name: status
+          in: query
+          style: form
+          explode: true
+          schema:
+            type: array
+            items: { $ref: '#/components/schemas/OrderStatus' }
+        - name: customer_id
+          in: query
+          schema: { type: integer, format: int64 }
+        - name: created_at_gte
+          in: query
+          schema: { type: string, format: date-time }
+        - name: created_at_lte
+          in: query
+          schema: { type: string, format: date-time }
+        - name: total_gte
+          in: query
+          schema: { type: string, pattern: '^\d+(\.\d{1,2})?$' }
+        - name: total_lte
+          in: query
+          schema: { type: string, pattern: '^\d+(\.\d{1,2})?$' }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+        - name: sort
+          in: query
+          schema: { type: string, default: '-created_at' }
+      responses:
+        '200':
+          description: Order list.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Order' }
+                  meta: { $ref: '#/components/schemas/PaginationMeta' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /admin/orders/{orderId}:
+    get:
+      operationId: adminGetOrder
+      tags: [admin]
+      summary: Get any order
+      description: 'Required role: `order_manager` or `admin`.'
+      security: [{ adminJWT: [] }]
+      parameters:
+        - name: orderId
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      responses:
+        '200':
+          description: Order.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Order' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /admin/orders/{orderId}/status:
+    patch:
+      operationId: adminUpdateOrderStatus
+      tags: [admin]
+      summary: Transition an order's status
+      description: >
+        Required role: `order_manager` or `admin`. Goes through the same Orders Module state-machine
+        the storefront checkout uses — invalid transitions (e.g. `delivered` → `pending_payment`)
+        are rejected with `409`, not silently applied.
+      security: [{ adminJWT: [] }]
+      parameters:
+        - name: orderId
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateOrderStatusRequest'
+      responses:
+        '200':
+          description: Updated order.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Order' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Requested status is not a valid transition from the current status.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /admin/settings:
+    get:
+      operationId: adminGetSettings
+      tags: [admin]
+      summary: Get shop settings
+      description: >
+        Required role: `admin`. **Judgment call**: `docs/database.md` does not model a settings
+        table explicitly; this contract assumes a simple single-row configuration resource. Confirm
+        the storage mechanism during implementation and update `docs/database.md` if it introduces a
+        new table.
+      security: [{ adminJWT: [] }]
+      responses:
+        '200':
+          description: Settings.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Settings' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    patch:
+      operationId: adminUpdateSettings
+      tags: [admin]
+      summary: Update shop settings
+      description: 'Required role: `admin`.'
+      security: [{ adminJWT: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateSettingsRequest'
+      responses:
+        '200':
+          description: Updated settings.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Settings' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /admin/roles:
+    get:
+      operationId: adminListRoles
+      tags: [admin]
+      summary: List RBAC roles
+      description: >
+        Required role: `admin`. The set of role **codes** (`admin`, `order_manager`,
+        `content_manager`) is fixed by the architecture, not user-extensible — this endpoint exists
+        for UI dropdowns and to expose each role's `permissions` document, not to create new roles
+        (there is no `POST`).
+      security: [{ adminJWT: [] }]
+      responses:
+        '200':
+          description: Role list.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Role' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /admin/roles/{roleId}:
+    get:
+      operationId: adminGetRole
+      tags: [admin]
+      summary: Get a role
+      description: 'Required role: `admin`.'
+      security: [{ adminJWT: [] }]
+      parameters:
+        - name: roleId
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      responses:
+        '200':
+          description: Role.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Role' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    patch:
+      operationId: adminUpdateRole
+      tags: [admin]
+      summary: Update a role's permissions
+      description: 'Required role: `admin`. Only `permissions` is mutable — `code` and `name` are
+        fixed by the architecture''s three-role model.'
+      security: [{ adminJWT: [] }]
+      parameters:
+        - name: roleId
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateRoleRequest'
+      responses:
+        '200':
+          description: Updated role.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Role' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /admin/admin-users:
+    get:
+      operationId: adminListAdminUsers
+      tags: [admin]
+      summary: List staff accounts
+      description: 'Required role: `admin`.'
+      security: [{ adminJWT: [] }]
+      parameters:
+        - name: role
+          in: query
+          schema: { $ref: '#/components/schemas/RoleName' }
+        - name: is_active
+          in: query
+          schema: { type: boolean }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Staff account list.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/AdminUser' }
+                  meta: { $ref: '#/components/schemas/PaginationMeta' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    post:
+      operationId: adminCreateAdminUser
+      tags: [admin]
+      summary: Create a staff account
+      description: 'Required role: `admin`.'
+      security: [{ adminJWT: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateAdminUserRequest'
+      responses:
+        '201':
+          description: Staff account created.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/AdminUser' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /admin/admin-users/{adminUserId}:
+    get:
+      operationId: adminGetAdminUser
+      tags: [admin]
+      summary: Get a staff account
+      description: 'Required role: `admin`.'
+      security: [{ adminJWT: [] }]
+      parameters:
+        - name: adminUserId
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      responses:
+        '200':
+          description: Staff account.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/AdminUser' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    patch:
+      operationId: adminUpdateAdminUser
+      tags: [admin]
+      summary: Update a staff account (role, active flag, password reset)
+      description: 'Required role: `admin`.'
+      security: [{ adminJWT: [] }]
+      parameters:
+        - name: adminUserId
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateAdminUserRequest'
+      responses:
+        '200':
+          description: Updated staff account.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/AdminUser' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    delete:
+      operationId: adminDeactivateAdminUser
+      tags: [admin]
+      summary: Deactivate a staff account
+      description: >
+        Required role: `admin`. Implemented as deactivation (`is_active: false`), not a hard delete
+        — staff accounts are kept for audit trail (e.g. `admin_users` referenced from future audit
+        logs of order status changes). A `204` is returned either way; deactivated accounts can no
+        longer authenticate.
+      security: [{ adminJWT: [] }]
+      parameters:
+        - name: adminUserId
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      responses:
+        '204':
+          description: Deactivated.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+components:
+  securitySchemes:
+    initData:
+      type: apiKey
+      in: header
+      name: Authorization
+      description: >
+        Telegram Web App initData. Send as `Authorization: tma <initData>`, where `<initData>` is
+        the raw, URL-encoded initData string handed to the storefront by the Telegram client SDK.
+        Signature verification against the bot token happens exclusively inside `api` (Auth Module);
+        there is no client-side verification endpoint and none should ever be added.
+    adminJWT:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >
+        Staff authentication. Obtain a token pair via `POST /admin/auth/login`, refresh via
+        `POST /admin/auth/refresh`. Distinct from `initData` by design — storefront and admin never
+        share an authentication mechanism.
+    providerSignature:
+      type: apiKey
+      in: header
+      name: X-Payment-Signature
+      description: >
+        Signature computed by the payment provider over the raw webhook request body (e.g. HMAC-SHA256
+        with a provider-issued secret). The exact algorithm and native header name are
+        provider-specific (Telegram Payments / YooKassa / Stripe each differ); `X-Payment-Signature`
+        is this contract's normalized header name — mapping a provider's native signature header
+        into it, if they differ, is an implementation detail of the webhook route, not a v1 concern.
+        A request with a missing or invalid signature must be rejected with `401` before any
+        business logic runs.
+
+  parameters:
+    Page:
+      name: page
+      in: query
+      description: 1-indexed page number.
+      schema: { type: integer, minimum: 1, default: 1 }
+    Limit:
+      name: limit
+      in: query
+      description: Items per page.
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+    Fields:
+      name: fields
+      in: query
+      description: Comma-separated sparse fieldset. Reduces payload size by returning only the
+        named top-level fields of each item.
+      schema: { type: string }
+      example: id,name,price
+    CategoryIdOrSlug:
+      name: categoryId
+      in: path
+      required: true
+      description: Category `id` (integer) or `slug` (string) — both are accepted by the same
+        lookup.
+      schema: { type: string }
+    ProductIdOrSlug:
+      name: productId
+      in: path
+      required: true
+      description: Product `id` (integer) or `slug` (string) — both are accepted by the same
+        lookup.
+      schema: { type: string }
+    PostIdOrSlug:
+      name: postId
+      in: path
+      required: true
+      description: Post `id` (integer) or `slug` (string) — both are accepted by the same lookup.
+      schema: { type: string }
+
+  responses:
+    BadRequest:
+      description: Malformed request (bad query parameter, invalid JSON, etc.).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unauthorized:
+      description: Missing, invalid, or expired credentials.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Forbidden:
+      description: Authenticated, but the role does not permit this operation.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Resource does not exist.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Conflict:
+      description: State conflict (duplicate unique key, invalid state transition, or a referenced
+        resource still in use).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    UnprocessableEntity:
+      description: Request is well-formed JSON but fails semantic/business validation.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    TooManyRequests:
+      description: Rate limit exceeded.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    InternalError:
+      description: Unexpected server error.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    # ------------------------------------------------------------- shared --
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: Stable machine-readable error code.
+              enum:
+                - VALIDATION_ERROR
+                - UNAUTHORIZED
+                - FORBIDDEN
+                - NOT_FOUND
+                - CONFLICT
+                - RATE_LIMITED
+                - INTERNAL_ERROR
+              example: VALIDATION_ERROR
+            message:
+              type: string
+              description: Human-readable description, safe to display to staff (not necessarily to
+                end customers).
+              example: email must be a valid email address
+            details:
+              type: array
+              items:
+                type: object
+                required: [field, issue]
+                properties:
+                  field: { type: string, example: email }
+                  issue: { type: string, example: must be a valid email address }
+
+    Money:
+      type: string
+      description: Decimal amount with exactly two fraction digits, in the shop's single operating
+        currency (see `Settings.default_currency`). No embedded currency code — see the `info`
+        block for why.
+      pattern: '^\d+\.\d{2}$'
+      example: '1999.00'
+
+    PaginationMeta:
+      type: object
+      required: [page, limit, total, total_pages]
+      properties:
+        page: { type: integer, minimum: 1 }
+        limit: { type: integer, minimum: 1, maximum: 100 }
+        total: { type: integer, minimum: 0 }
+        total_pages: { type: integer, minimum: 0 }
+
+    # --------------------------------------------------------------- auth --
+    AdminLoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string, minLength: 8 }
+
+    RefreshRequest:
+      type: object
+      required: [refresh_token]
+      properties:
+        refresh_token: { type: string }
+
+    TokenPair:
+      type: object
+      required: [access_token, refresh_token, token_type, expires_in]
+      properties:
+        access_token: { type: string }
+        refresh_token: { type: string }
+        token_type: { type: string, const: Bearer }
+        expires_in:
+          type: integer
+          description: Access token lifetime in seconds.
+          example: 900
+
+    RoleName:
+      type: string
+      enum: [admin, order_manager, content_manager]
+
+    AdminUser:
+      type: object
+      required: [id, email, role, is_active, created_at]
+      properties:
+        id: { type: integer, format: int64 }
+        email: { type: string, format: email }
+        full_name:
+          type: ["string", "null"]
+          description: >
+            Judgment call: `docs/database.md`'s `admin_users` table does not currently list a
+            `full_name` column, only `email`/`password_hash`/`role_id`. Added here as an optional,
+            additive display field for the admin UI (e.g. attributing order-status changes to a
+            person); confirm and add the column during implementation, or drop this field if the
+            team prefers email-only identification.
+        role: { $ref: '#/components/schemas/RoleName' }
+        is_active: { type: boolean }
+        created_at: { type: string, format: date-time }
+
+    CreateAdminUserRequest:
+      type: object
+      required: [email, password, role]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string, minLength: 8 }
+        role: { $ref: '#/components/schemas/RoleName' }
+        full_name: { type: ["string", "null"] }
+
+    UpdateAdminUserRequest:
+      type: object
+      properties:
+        role: { $ref: '#/components/schemas/RoleName' }
+        is_active: { type: boolean }
+        full_name: { type: ["string", "null"] }
+        password:
+          type: string
+          minLength: 8
+          description: Set to reset the account's password.
+
+    Role:
+      type: object
+      required: [id, code, name, permissions]
+      properties:
+        id: { type: integer, format: int64 }
+        code: { $ref: '#/components/schemas/RoleName' }
+        name: { type: string }
+        permissions:
+          type: object
+          additionalProperties: true
+          description: Free-form permission document (jsonb in storage); shape is an implementation
+            detail beyond the fixed role codes.
+
+    UpdateRoleRequest:
+      type: object
+      required: [permissions]
+      properties:
+        permissions:
+          type: object
+          additionalProperties: true
+
+    Customer:
+      type: object
+      required: [id, telegram_id, created_at]
+      properties:
+        id: { type: integer, format: int64 }
+        telegram_id: { type: integer, format: int64 }
+        username: { type: ["string", "null"] }
+        first_name: { type: ["string", "null"] }
+        last_name: { type: ["string", "null"] }
+        created_at: { type: string, format: date-time }
+
+    # ------------------------------------------------------------ catalog --
+    Category:
+      type: object
+      required: [id, name, slug, position, is_active, created_at, updated_at]
+      properties:
+        id: { type: integer, format: int64 }
+        parent_id: { type: ["integer", "null"], format: int64 }
+        name: { type: string }
+        slug: { type: string }
+        description:
+          type: ["string", "null"]
+          description: >
+            Judgment call / additive field: not present in the current (indicative)
+            `docs/database.md` ERD for `categories`, added here for storefront category-landing
+            copy. Non-breaking to add later if omitted now, but flagged for confirmation.
+        image:
+          oneOf:
+            - $ref: '#/components/schemas/Media'
+            - type: 'null'
+          description: Same judgment-call status as `description` above.
+        position: { type: integer }
+        is_active: { type: boolean }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    CreateCategoryRequest:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string }
+        slug:
+          type: string
+          description: Auto-derived from `name` when omitted.
+        parent_id: { type: ["integer", "null"], format: int64 }
+        description: { type: ["string", "null"] }
+        image_id: { type: ["integer", "null"], format: int64 }
+        position: { type: integer, default: 0 }
+        is_active: { type: boolean, default: true }
+
+    UpdateCategoryRequest:
+      type: object
+      properties:
+        name: { type: string }
+        slug: { type: string }
+        parent_id: { type: ["integer", "null"], format: int64 }
+        description: { type: ["string", "null"] }
+        image_id: { type: ["integer", "null"], format: int64 }
+        position: { type: integer }
+        is_active: { type: boolean }
+
+    Dictionary:
+      type: object
+      required: [id, code, name, created_at]
+      properties:
+        id: { type: integer, format: int64 }
+        code: { type: string }
+        name: { type: string }
+        created_at: { type: string, format: date-time }
+
+    CreateDictionaryRequest:
+      type: object
+      required: [code, name]
+      properties:
+        code: { type: string }
+        name: { type: string }
+
+    UpdateDictionaryRequest:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string }
+
+    DictionaryValue:
+      type: object
+      required: [id, dictionary_id, value, position, is_archived, created_at]
+      properties:
+        id: { type: integer, format: int64 }
+        dictionary_id: { type: integer, format: int64 }
+        value: { type: string }
+        position: { type: integer }
+        is_archived:
+          type: boolean
+          description: 'True once `archived_at` is set. Archived values are excluded from
+            new-product pickers but keep rendering correctly on products created before archiving.'
+        created_at: { type: string, format: date-time }
+
+    CreateDictionaryValueRequest:
+      type: object
+      required: [value]
+      properties:
+        value: { type: string }
+        position: { type: integer, default: 0 }
+
+    UpdateDictionaryValueRequest:
+      type: object
+      properties:
+        value: { type: string }
+        position: { type: integer }
+        is_archived: { type: boolean }
+
+    FieldDefinitionType:
+      type: string
+      enum: [string, number, bool, date, dictionary, dictionary_multi]
+      description: >
+        `dictionary`/`dictionary_multi` reference `DictionaryValue` rows by id (never free text, per
+        ADR-002). `date` is a judgment-call addition beyond `docs/database.md`'s indicative
+        `"string, number, bool, dictionary, dictionary_multi, ..."` comment — the ERD's trailing
+        `...` signals the type list is not closed.
+
+    FieldDefinition:
+      type: object
+      required: [id, category_id, code, label, type, required, position, show_in_list, is_deprecated, created_at]
+      properties:
+        id: { type: integer, format: int64 }
+        category_id: { type: integer, format: int64 }
+        dictionary_id:
+          type: ["integer", "null"]
+          format: int64
+          description: Required (non-null) when `type` is `dictionary` or `dictionary_multi`; must
+            be null otherwise.
+        code: { type: string, description: Stable machine key used as the property name inside
+          `products.attributes`. }
+        label: { type: string, description: Human-readable label shown in forms and filters. }
+        type: { $ref: '#/components/schemas/FieldDefinitionType' }
+        required: { type: boolean }
+        validation:
+          type: ["object", "null"]
+          additionalProperties: true
+          description: Free-form validation rules (jsonb), e.g. `min`/`max`/`min_length`/
+            `max_length`/`pattern`, interpreted per `type`.
+        position: { type: integer }
+        show_in_list:
+          type: boolean
+          description: Whether this field renders as a column in the admin product list.
+        is_deprecated: { type: boolean }
+        created_at: { type: string, format: date-time }
+
+    CreateFieldDefinitionRequest:
+      type: object
+      required: [category_id, code, label, type, required]
+      properties:
+        category_id: { type: integer, format: int64 }
+        dictionary_id: { type: ["integer", "null"], format: int64 }
+        code: { type: string }
+        label: { type: string }
+        type: { $ref: '#/components/schemas/FieldDefinitionType' }
+        required: { type: boolean, default: false }
+        validation: { type: ["object", "null"], additionalProperties: true }
+        position: { type: integer, default: 0 }
+        show_in_list: { type: boolean, default: false }
+
+    UpdateFieldDefinitionRequest:
+      type: object
+      description: '`category_id`, `code`, `type`, and `dictionary_id` are intentionally absent —
+        they are immutable after creation.'
+      properties:
+        label: { type: string }
+        required: { type: boolean }
+        validation: { type: ["object", "null"], additionalProperties: true }
+        position: { type: integer }
+        show_in_list: { type: boolean }
+        is_deprecated: { type: boolean }
+
+    DictionaryValueRef:
+      type: object
+      required: [id, value, is_archived]
+      properties:
+        id: { type: integer, format: int64 }
+        value: { type: string }
+        is_archived: { type: boolean }
+
+    AttributeValue:
+      type: object
+      description: >
+        A single resolved product characteristic. For `dictionary`/`dictionary_multi` fields,
+        `dictionary_values` carries the resolved label(s) — the raw id in storage is never returned
+        without its current label attached, per ADR-002.
+      required: [field_definition_id, code, label, type]
+      properties:
+        field_definition_id: { type: integer, format: int64 }
+        code: { type: string }
+        label: { type: string }
+        type: { $ref: '#/components/schemas/FieldDefinitionType' }
+        value:
+          description: Present for `string`/`number`/`bool`/`date` types.
+          oneOf:
+            - type: string
+            - type: number
+            - type: boolean
+        dictionary_values:
+          description: Present for `dictionary` (one item) and `dictionary_multi` (0..n items) types.
+          type: array
+          items: { $ref: '#/components/schemas/DictionaryValueRef' }
+
+    AttributeValueInput:
+      type: object
+      description: Write-side counterpart of `AttributeValue`. Provide `value` for scalar field
+        types, or `dictionary_value_ids` for `dictionary`/`dictionary_multi` field types — never
+        both. Validated server-side against the field's `field_definitions.type`.
+      required: [field_definition_id]
+      properties:
+        field_definition_id: { type: integer, format: int64 }
+        value:
+          oneOf:
+            - type: string
+            - type: number
+            - type: boolean
+        dictionary_value_ids:
+          type: array
+          items: { type: integer, format: int64 }
+
+    Media:
+      type: object
+      required: [id, bucket, object_key, url, content_type, size_bytes, created_at]
+      properties:
+        id: { type: integer, format: int64 }
+        bucket: { type: string }
+        object_key: { type: string }
+        url:
+          type: string
+          format: uri
+          description: Public read URL, built from `S3_PUBLIC_URL` per `docs/architecture.md`.
+        content_type: { type: string, example: image/webp }
+        size_bytes: { type: integer, format: int64 }
+        width: { type: ["integer", "null"] }
+        height: { type: ["integer", "null"] }
+        created_at: { type: string, format: date-time }
+
+    ProductImage:
+      type: object
+      required: [media, position]
+      properties:
+        media: { $ref: '#/components/schemas/Media' }
+        position: { type: integer }
+        alt:
+          type: ["string", "null"]
+          description: Alt text is per-usage (`product_images.alt`), not on the `Media` record
+            itself, since the same file could in principle be reused with different alt text.
+
+    ProductImageInput:
+      type: object
+      required: [media_id]
+      properties:
+        media_id: { type: integer, format: int64 }
+        position: { type: integer, default: 0 }
+        alt: { type: ["string", "null"] }
+
+    Product:
+      type: object
+      required: [id, category_id, name, slug, price, stock, is_active, images, attributes, created_at, updated_at]
+      properties:
+        id: { type: integer, format: int64 }
+        category_id: { type: integer, format: int64 }
+        name: { type: string }
+        slug: { type: string }
+        description:
+          type: ["string", "null"]
+          description: 'Judgment-call addition: not in the current `docs/database.md` ERD for
+            `products` (which lists `name`/`slug`/`price`/`stock`/`attributes`/`is_active` only);
+            flagged for confirmation, same rationale as `Category.description`.'
+        price: { $ref: '#/components/schemas/Money' }
+        stock: { type: integer, minimum: 0 }
+        is_active: { type: boolean }
+        images:
+          type: array
+          items: { $ref: '#/components/schemas/ProductImage' }
+        attributes:
+          type: array
+          items: { $ref: '#/components/schemas/AttributeValue' }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    ProductListItem:
+      type: object
+      description: Reduced projection for list views (extensibility/perf) — full `attributes` are
+        only returned by `GET /products/{productId}`.
+      required: [id, category_id, name, slug, price, in_stock]
+      properties:
+        id: { type: integer, format: int64 }
+        category_id: { type: integer, format: int64 }
+        name: { type: string }
+        slug: { type: string }
+        price: { $ref: '#/components/schemas/Money' }
+        primary_image:
+          oneOf:
+            - $ref: '#/components/schemas/Media'
+            - type: 'null'
+        in_stock: { type: boolean, description: 'Derived: `stock > 0`.' }
+
+    CreateProductRequest:
+      type: object
+      required: [category_id, name, price, stock]
+      properties:
+        category_id: { type: integer, format: int64 }
+        name: { type: string }
+        slug: { type: string, description: Auto-derived from `name` when omitted. }
+        description: { type: ["string", "null"] }
+        price: { $ref: '#/components/schemas/Money' }
+        stock: { type: integer, minimum: 0 }
+        is_active: { type: boolean, default: true }
+        images:
+          type: array
+          items: { $ref: '#/components/schemas/ProductImageInput' }
+        attributes:
+          type: array
+          items: { $ref: '#/components/schemas/AttributeValueInput' }
+
+    UpdateProductRequest:
+      type: object
+      properties:
+        category_id: { type: integer, format: int64 }
+        name: { type: string }
+        slug: { type: string }
+        description: { type: ["string", "null"] }
+        price: { $ref: '#/components/schemas/Money' }
+        stock: { type: integer, minimum: 0 }
+        is_active: { type: boolean }
+        images:
+          type: array
+          items: { $ref: '#/components/schemas/ProductImageInput' }
+        attributes:
+          type: array
+          items: { $ref: '#/components/schemas/AttributeValueInput' }
+
+    FacetValue:
+      type: object
+      required: [dictionary_value_id, value, count]
+      properties:
+        dictionary_value_id: { type: integer, format: int64 }
+        value: { type: string }
+        count:
+          type: integer
+          minimum: 0
+          description: Number of active products in this category carrying this value.
+
+    Facet:
+      type: object
+      required: [field_definition_id, code, label, type, values]
+      properties:
+        field_definition_id: { type: integer, format: int64 }
+        code: { type: string }
+        label: { type: string }
+        type: { $ref: '#/components/schemas/FieldDefinitionType' }
+        values:
+          type: array
+          items: { $ref: '#/components/schemas/FacetValue' }
+
+    # ------------------------------------------------------------ content --
+    Post:
+      type: object
+      required: [id, title, slug, body_html, created_at, updated_at]
+      properties:
+        id: { type: integer, format: int64 }
+        title: { type: string }
+        slug: { type: string }
+        body_html:
+          type: string
+          description: >
+            Sanitized HTML produced by the admin's TipTap rich-text editor (ADR-001). Naming
+            judgment call: `docs/database.md` names the column simply `body`; `body_html` here
+            documents its actual content shape for API consumers.
+        cover_image:
+          oneOf:
+            - $ref: '#/components/schemas/Media'
+            - type: 'null'
+        published_at:
+          type: ["string", "null"]
+          format: date-time
+          description: Null means draft. The storefront (`GET /posts`) never returns drafts.
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    CreatePostRequest:
+      type: object
+      required: [title, body_html]
+      properties:
+        title: { type: string }
+        slug: { type: string, description: Auto-derived from `title` when omitted. }
+        body_html: { type: string }
+        cover_media_id: { type: ["integer", "null"], format: int64 }
+        published_at:
+          type: ["string", "null"]
+          format: date-time
+          description: Omit or set null to save as a draft.
+
+    UpdatePostRequest:
+      type: object
+      properties:
+        title: { type: string }
+        slug: { type: string }
+        body_html: { type: string }
+        cover_media_id: { type: ["integer", "null"], format: int64 }
+        published_at: { type: ["string", "null"], format: date-time }
+
+    # ---------------------------------------------------------------- cart --
+    CartItem:
+      type: object
+      required: [product_id, name, price, quantity, line_total]
+      properties:
+        product_id: { type: integer, format: int64 }
+        name:
+          type: string
+          description: Live product name at read time (the cart is not a snapshot; snapshotting
+            happens only at checkout).
+        price: { $ref: '#/components/schemas/Money' }
+        quantity: { type: integer, minimum: 1 }
+        image:
+          oneOf:
+            - $ref: '#/components/schemas/Media'
+            - type: 'null'
+        line_total: { $ref: '#/components/schemas/Money' }
+
+    Cart:
+      type: object
+      required: [items, subtotal, item_count, updated_at]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/CartItem' }
+        subtotal: { $ref: '#/components/schemas/Money' }
+        item_count: { type: integer, minimum: 0 }
+        updated_at: { type: string, format: date-time }
+
+    AddCartItemRequest:
+      type: object
+      required: [product_id, quantity]
+      properties:
+        product_id: { type: integer, format: int64 }
+        quantity: { type: integer, minimum: 1, default: 1 }
+
+    UpdateCartItemRequest:
+      type: object
+      required: [quantity]
+      properties:
+        quantity: { type: integer, minimum: 1 }
+
+    # ------------------------------------------------------------ delivery --
+    Address:
+      type: object
+      required: [country, city, street, building]
+      properties:
+        country: { type: string }
+        city: { type: string }
+        street: { type: string }
+        building: { type: string }
+        apartment: { type: ["string", "null"] }
+        postal_code: { type: ["string", "null"] }
+        comment: { type: ["string", "null"] }
+
+    DeliveryMethod:
+      type: object
+      required: [id, code, name, price, is_active]
+      properties:
+        id: { type: integer, format: int64 }
+        code: { type: string }
+        name: { type: string }
+        price:
+          allOf:
+            - $ref: '#/components/schemas/Money'
+          description: Base price before any `config`-driven adjustments (e.g. free-over-threshold)
+            are applied by `POST /delivery-quotes`.
+        config:
+          type: object
+          additionalProperties: true
+          description: Free-form pricing/eligibility config (jsonb), e.g. `free_from`, weight
+            brackets, region restrictions.
+        is_active: { type: boolean }
+
+    CreateDeliveryMethodRequest:
+      type: object
+      required: [code, name, price]
+      properties:
+        code: { type: string }
+        name: { type: string }
+        price: { $ref: '#/components/schemas/Money' }
+        config: { type: object, additionalProperties: true }
+        is_active: { type: boolean, default: true }
+
+    UpdateDeliveryMethodRequest:
+      type: object
+      properties:
+        name: { type: string }
+        price: { $ref: '#/components/schemas/Money' }
+        config: { type: object, additionalProperties: true }
+        is_active: { type: boolean }
+
+    DeliveryQuoteRequest:
+      type: object
+      required: [delivery_method_id, address]
+      properties:
+        delivery_method_id: { type: integer, format: int64 }
+        address: { $ref: '#/components/schemas/Address' }
+
+    DeliveryQuote:
+      type: object
+      required: [delivery_method_id, cost]
+      properties:
+        delivery_method_id: { type: integer, format: int64 }
+        cost:
+          allOf:
+            - $ref: '#/components/schemas/Money'
+          description: Final computed cost for the current cart + address (may be `0.00` if the
+            cart qualifies for free delivery under `config`).
+
+    # -------------------------------------------------------------- orders --
+    OrderStatus:
+      type: string
+      enum: [pending_payment, paid, processing, shipped, delivered, cancelled, refunded]
+
+    AttributeSnapshot:
+      type: object
+      description: >
+        Frozen product characteristic captured at purchase time. Unlike the live `AttributeValue`,
+        this stores plain display text, not dictionary-value ids — so a later rename or archival of
+        the dictionary value can never alter what a past order shows (per the `order_items`
+        invariant in `docs/architecture.md`).
+      required: [code, label, value]
+      properties:
+        code: { type: string }
+        label: { type: string }
+        value:
+          description: Frozen display text; an array for what was a `dictionary_multi` field at
+            purchase time.
+          oneOf:
+            - type: string
+            - type: array
+              items: { type: string }
+
+    OrderItem:
+      type: object
+      required: [id, name, price, quantity, attributes, line_total]
+      properties:
+        id: { type: integer, format: int64 }
+        product_id:
+          type: ["integer", "null"]
+          format: int64
+          description: Snapshot-reference only; nullable because deleting the live product must
+            never remove or reinterpret this line (`docs/architecture.md` — `order_items` stores a
+            snapshot).
+        name: { type: string, description: '`name_snapshot` at purchase time.' }
+        price: { allOf: [{ $ref: '#/components/schemas/Money' }], description: '`price_snapshot` at
+          purchase time.' }
+        quantity: { type: integer, minimum: 1 }
+        attributes:
+          type: array
+          items: { $ref: '#/components/schemas/AttributeSnapshot' }
+        line_total:
+          allOf: [{ $ref: '#/components/schemas/Money' }]
+          description: 'Derived: `price * quantity`. Not a separate stored column.'
+
+    OrderPaymentSummary:
+      type: object
+      description: The order's most recent `Payment`, if one has been initiated.
+      required: [payment_id, status, amount]
+      properties:
+        payment_id: { type: integer, format: int64 }
+        status: { $ref: '#/components/schemas/PaymentStatus' }
+        amount: { $ref: '#/components/schemas/Money' }
+        confirmation_url: { type: ["string", "null"], format: uri }
+
+    Order:
+      type: object
+      required:
+        - id
+        - number
+        - customer_id
+        - status
+        - items
+        - delivery_name
+        - delivery_price
+        - address
+        - payment_method_name
+        - subtotal
+        - total
+        - created_at
+        - updated_at
+      properties:
+        id: { type: integer, format: int64 }
+        number:
+          type: string
+          description: 'Judgment call: derived, human-friendly display string (e.g. `"ORD-000123"`
+            formatted from `id`), not a separate stored column in `docs/database.md`.'
+        customer_id:
+          type: integer
+          format: int64
+          description: 'Naming judgment call: maps to the `orders.user_id` column; renamed here for
+            API clarity (a "user" of the storefront is always a "customer" in this contract).'
+        status: { $ref: '#/components/schemas/OrderStatus' }
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/OrderItem' }
+        delivery_method_id:
+          type: ["integer", "null"]
+          format: int64
+          description: Reference to the *current* `DeliveryMethod` row; nullable because that method
+            may later be deleted without touching this order (see `delivery_name`/`delivery_price`).
+        delivery_name: { type: string, description: '`delivery_name_snapshot` at checkout time.' }
+        delivery_price: { allOf: [{ $ref: '#/components/schemas/Money' }], description:
+          '`delivery_price_snapshot` at checkout time.' }
+        address: { $ref: '#/components/schemas/Address' }
+        payment_method_id:
+          type: ["integer", "null"]
+          format: int64
+          description: Reference to the *current* `PaymentMethod` row; nullable, same rationale as
+            `delivery_method_id`.
+        payment_method_name: { type: string, description: '`payment_name_snapshot` at checkout
+          time.' }
+        payment:
+          oneOf:
+            - $ref: '#/components/schemas/OrderPaymentSummary'
+            - type: 'null'
+        subtotal:
+          allOf: [{ $ref: '#/components/schemas/Money' }]
+          description: 'Derived: sum of `items[].line_total`. Not a separate stored column
+            (`docs/database.md` stores only the final `total`).'
+        total: { $ref: '#/components/schemas/Money' }
+        comment:
+          type: ["string", "null"]
+          description: >
+            Judgment-call addition: a free-text delivery note from the customer (e.g. "leave at the
+            door"). Not present in the current `docs/database.md` `orders` table; flagged for
+            confirmation — if adopted, it likely belongs inside `delivery_address` jsonb rather than
+            a new column, to avoid a migration.
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    CreateOrderRequest:
+      type: object
+      required: [delivery_method_id, address, payment_method_id]
+      properties:
+        delivery_method_id: { type: integer, format: int64 }
+        address: { $ref: '#/components/schemas/Address' }
+        payment_method_id: { type: integer, format: int64 }
+        comment: { type: ["string", "null"] }
+
+    UpdateOrderStatusRequest:
+      type: object
+      required: [status]
+      properties:
+        status: { $ref: '#/components/schemas/OrderStatus' }
+        comment:
+          type: ["string", "null"]
+          description: Optional internal note explaining the transition (e.g. a refund reason).
+
+    # ------------------------------------------------------------- payment --
+    PaymentStatus:
+      type: string
+      enum: [pending, succeeded, failed, refunded, cancelled]
+
+    PaymentMethod:
+      type: object
+      required: [id, code, name, provider, is_active]
+      properties:
+        id: { type: integer, format: int64 }
+        code: { type: string }
+        name: { type: string }
+        provider:
+          type: string
+          enum: [telegram, yookassa, stripe]
+          description: External payment provider this method routes to (all optional per
+            `docs/architecture.md` System Context — the payment provider is an external, optional
+            system).
+        is_active: { type: boolean }
+
+    CreatePaymentMethodRequest:
+      type: object
+      required: [code, name, provider]
+      properties:
+        code: { type: string }
+        name: { type: string }
+        provider: { type: string, enum: [telegram, yookassa, stripe] }
+        is_active: { type: boolean, default: true }
+
+    UpdatePaymentMethodRequest:
+      type: object
+      properties:
+        name: { type: string }
+        is_active: { type: boolean }
+
+    Payment:
+      type: object
+      required: [id, order_id, provider, status, amount, created_at, updated_at]
+      properties:
+        id: { type: integer, format: int64 }
+        order_id: { type: integer, format: int64 }
+        provider: { type: string, enum: [telegram, yookassa, stripe] }
+        provider_payment_id:
+          type: ["string", "null"]
+          description: Provider-side payment id. Null until the provider assigns one at initiation;
+            unique once set — the webhook uses it as the idempotency key.
+        status: { $ref: '#/components/schemas/PaymentStatus' }
+        amount: { $ref: '#/components/schemas/Money' }
+        confirmation_url:
+          type: ["string", "null"]
+          format: uri
+          description: Provider-hosted checkout URL. Not guaranteed persisted verbatim long-term
+            (provider sessions expire) — re-initiate (`POST /orders/{orderId}/payments`) to get a
+            fresh one.
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    InitiatePaymentRequest:
+      type: object
+      properties:
+        payment_method_id:
+          type: integer
+          format: int64
+          description: Defaults to the order's existing `payment_method_id` if omitted.
+
+    PaymentWebhookPayload:
+      type: object
+      description: >
+        Normalized webhook envelope this contract commits to. Real providers (Telegram Payments /
+        YooKassa / Stripe) each send a differently-shaped payload; translating a provider's native
+        body into this shape is an implementation detail of the route handler for that `{provider}`,
+        not a v1 contract concern.
+      required: [provider_payment_id, status, raw]
+      properties:
+        provider_payment_id: { type: string }
+        order_id:
+          type: ["integer", "null"]
+          format: int64
+          description: Included when the provider echoes back the merchant order reference; if
+            absent, the handler resolves the order via a prior `Payment.provider_payment_id`
+            mapping recorded at initiation.
+        status:
+          type: string
+          enum: [succeeded, failed, refunded]
+        raw:
+          type: object
+          additionalProperties: true
+          description: Provider's original payload, passed through verbatim for auditing/debugging.
+
+    # --------------------------------------------------------------- media --
+    MediaPurpose:
+      type: string
+      enum: [product_image, post_cover]
+
+    PresignUploadRequest:
+      type: object
+      required: [filename, content_type, size_bytes, purpose]
+      properties:
+        filename: { type: string }
+        content_type:
+          type: string
+          description: Must be one of the allowlisted image types for the given `purpose`
+            (implementation-defined, e.g. `image/jpeg`, `image/png`, `image/webp`).
+        size_bytes:
+          type: integer
+          format: int64
+          description: Must not exceed the per-`purpose` limit returned in `PresignedUpload.max_size_bytes`.
+        purpose: { $ref: '#/components/schemas/MediaPurpose' }
+
+    PresignedUpload:
+      type: object
+      required: [upload_url, upload_method, object_key, expires_at, max_size_bytes, allowed_content_types]
+      properties:
+        upload_url:
+          type: string
+          format: uri
+          description: Presigned URL, signed against `S3_PUBLIC_URL` (never the internal MinIO
+            address) so browser uploads validate correctly.
+        upload_method: { type: string, const: PUT }
+        object_key: { type: string }
+        required_headers:
+          type: object
+          additionalProperties: { type: string }
+          description: Headers the client must send verbatim with the PUT (e.g. `Content-Type`).
+        expires_at: { type: string, format: date-time }
+        max_size_bytes: { type: integer, format: int64 }
+        allowed_content_types:
+          type: array
+          items: { type: string }
+
+    ConfirmMediaRequest:
+      type: object
+      required: [object_key]
+      properties:
+        object_key: { type: string }
+        width: { type: ["integer", "null"] }
+        height: { type: ["integer", "null"] }
+
+    # --------------------------------------------------------------- admin --
+    Settings:
+      type: object
+      description: >
+        Judgment call: not modeled as a table in `docs/database.md`; assumed to be a single-row
+        configuration resource. Confirm the persistence mechanism during implementation.
+      required: [shop_name, default_currency, updated_at]
+      properties:
+        shop_name: { type: string }
+        default_currency:
+          type: string
+          description: ISO 4217 code, informational only (see `Money` — amounts themselves carry no
+            currency field since the shop is single-currency).
+          pattern: '^[A-Z]{3}$'
+          example: RUB
+        contact_email: { type: ["string", "null"], format: email }
+        contact_phone: { type: ["string", "null"] }
+        updated_at: { type: string, format: date-time }
+
+    UpdateSettingsRequest:
+      type: object
+      properties:
+        shop_name: { type: string }
+        default_currency: { type: string, pattern: '^[A-Z]{3}$' }
+        contact_email: { type: ["string", "null"], format: email }
+        contact_phone: { type: ["string", "null"] }
