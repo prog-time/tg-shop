@@ -1,0 +1,14 @@
+# oapi-codegen config (ADR-005). Generates models and the strict chi server
+# interface from the API contract. Run from backend/:
+#   go generate ./...
+# The contract is the single source of truth: edit docs/api/openapi.yaml first,
+# then regenerate. Wired up and used starting from the first domain slice.
+package: openapi
+output: internal/openapi/openapi.gen.go
+generate:
+  models: true
+  strict-server: true
+  chi-server: true
+  embedded-spec: true
+output-options:
+  skip-prune: false
