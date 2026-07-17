@@ -4,7 +4,12 @@
 # The contract is the single source of truth: edit docs/api/openapi.yaml first,
 # then regenerate. Wired up and used starting from the first domain slice.
 package: openapi
-output: internal/openapi/openapi.gen.go
+# `output` is relative to the process's working directory at invocation time,
+# not to this file. `go generate` runs the //go:generate directive (declared
+# in internal/openapi/generate.go) with cwd set to that file's directory
+# (backend/internal/openapi), so this resolves to
+# backend/internal/openapi/openapi.gen.go.
+output: openapi.gen.go
 generate:
   models: true
   strict-server: true
