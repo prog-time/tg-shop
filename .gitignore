@@ -4,6 +4,8 @@
 # Go
 /backend/bin/
 /backend/tmp/
+# throwaway copy produced by specprep during `go generate`, not the contract
+/backend/internal/openapi/openapi.normalized.yaml
 
 # Node
 node_modules/
@@ -20,3 +22,4 @@ dist/
 
 # Claude Code
 .claude/settings.local.json
+.claude/logs/
