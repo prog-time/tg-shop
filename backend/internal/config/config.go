@@ -62,6 +62,23 @@ func (c *Config) RequireDB() error {
 	return nil
 }
 
+// RequireAuth validates the fields the Auth Module needs: BOT_TOKEN backs
+// the HMAC secret key for storefront initData verification
+// (internal/auth/initdata.go), JWT_SECRET signs/verifies the staff access
+// token (internal/auth/jwt.go). Neither has a safe default — starting api
+// with either empty would silently accept a forged initData signature or
+// sign every admin session with a well-known key, so api refuses to start
+// rather than degrade quietly.
+func (c *Config) RequireAuth() error {
+	if c.BotToken == "" {
+		return fmt.Errorf("BOT_TOKEN is required")
+	}
+	if c.JWTSecret == "" {
+		return fmt.Errorf("JWT_SECRET is required")
+	}
+	return nil
+}
+
 // EnvOr returns the value of key k, or def when unset or empty.
 func EnvOr(k, def string) string {
 	if v := os.Getenv(k); v != "" {
