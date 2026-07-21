@@ -10,7 +10,9 @@ import (
 	"syscall"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/prog-time/tg-shop/backend/internal/auth"
 	"github.com/prog-time/tg-shop/backend/internal/config"
 	"github.com/prog-time/tg-shop/backend/internal/httpx"
 	"github.com/prog-time/tg-shop/backend/internal/logging"
@@ -34,6 +36,9 @@ func run() error {
 	log := logging.New(cfg.LogLevel)
 
 	if err := cfg.RequireDB(); err != nil {
+		return err
+	}
+	if err := cfg.RequireAuth(); err != nil {
 		return err
 	}
 
@@ -61,17 +66,18 @@ func run() error {
 	r := newRouter(log, map[string]httpx.Checker{
 		"postgres": func(ctx context.Context) error { return pool.Ping(ctx) },
 		"redis":    func(ctx context.Context) error { return rdb.Ping(ctx).Err() },
-	})
+	}, cfg, pool)
 
 	return httpx.Run(ctx, log, config.EnvOr("API_ADDR", ":8080"), r)
 }
 
 // newRouter builds the full HTTP router: liveness/readiness/metrics (as
-// before) plus the contract surface mounted under /api/v1. It takes no
-// dependency on postgres/redis directly (only the readiness checkers already
-// built from them), so it can be exercised in tests without a live database
-// or Redis connection.
-func newRouter(log *slog.Logger, ready map[string]httpx.Checker) *chi.Mux {
+// before) plus the contract surface mounted under /api/v1. cfg supplies the
+// Auth Module's secrets (BOT_TOKEN, JWT_SECRET); pool backs internal/auth's
+// Repo. pool may be nil in tests that only exercise routes without a domain
+// handler behind them (e.g. /healthz, the 501 catch-all) — auth.NewRepo
+// wraps it lazily and nothing in those tests calls a Repo method.
+func newRouter(log *slog.Logger, ready map[string]httpx.Checker, cfg *config.Config, pool *pgxpool.Pool) *chi.Mux {
 	r := httpx.BaseRouter(ready)
 
 	api := chi.NewRouter()
@@ -79,14 +85,22 @@ func newRouter(log *slog.Logger, ready map[string]httpx.Checker) *chi.Mux {
 	api.Use(httpx.Logging(log))
 	api.Use(httpx.Recoverer(log))
 
-	// No domain handlers exist yet (see docs/api/openapi.yaml, 49 paths / 79
-	// ops). Domain routers implement openapi.StrictServerInterface
-	// (internal/openapi/openapi.gen.go, generated via `go generate ./...`
-	// per ADR-005) and mount their routes here, incrementally replacing this
-	// catch-all as each domain slice lands (issue #5+). Storefront routes
-	// apply auth.RequireInitData, admin routes apply auth.RequireAdminJWT
-	// (internal/auth), matching the `initData`/`adminJWT` security schemes
-	// in docs/api/openapi.yaml — both are pass-through stubs today.
+	authRepo := auth.NewRepo(pool)
+	authHandlers := &auth.Handlers{
+		Service: &auth.Service{Repo: authRepo, JWTSecret: []byte(cfg.JWTSecret)},
+		Log:     log,
+	}
+	authHandlers.Mount(api, cfg.BotToken, []byte(cfg.JWTSecret))
+
+	// Every other domain handler is still unimplemented (see
+	// docs/api/openapi.yaml, 49 paths / 79 ops). Domain routers implement
+	// openapi.StrictServerInterface (internal/openapi/openapi.gen.go,
+	// generated via `go generate ./...` per ADR-005) and mount their routes
+	// here, incrementally replacing this catch-all as each domain slice
+	// lands (issue #6+). Storefront routes apply auth.RequireInitData,
+	// admin routes apply auth.RequireAdminJWT (internal/auth), matching the
+	// `initData`/`adminJWT` security schemes in docs/api/openapi.yaml — the
+	// auth module itself (issue #5) is the first slice wired for real.
 	api.HandleFunc("/*", httpx.NotImplemented)
 	api.NotFound(httpx.NotImplemented)
 	api.MethodNotAllowed(httpx.NotImplemented)
