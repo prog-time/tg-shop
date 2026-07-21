@@ -7,7 +7,8 @@
 > - значение справочника архивируется (`archived_at`), а не удаляется;
 > - поле не удаляется, а помечается устаревшим (`is_deprecated`);
 > - `order_items` / `orders` хранят снимок позиции, доставки и оплаты;
-> - `outbox` пишется в транзакции доменной операции, публикуется релеем.
+> - `outbox` пишется в транзакции доменной операции, публикуется релеем;
+> - `admin_refresh_tokens` хранит хэш refresh-токена персонала (не сам токен) и отзывается (`revoked_at`), а не удаляется — серверная сессия админки, которой нет у стейтлес-`initData` витрины.
 
 ```mermaid
 erDiagram
@@ -178,6 +179,7 @@ erDiagram
         text        password_hash
         bigint      role_id FK
         boolean     is_active
+        text        full_name "опционально, для отображения в админке"
         timestamptz created_at
     }
 
@@ -186,6 +188,18 @@ erDiagram
         text        name
         text        code UK "admin, order_manager, content_manager"
         jsonb       permissions
+    }
+
+    %% Серверная сессия персонала: логаут отзывает (revoked_at), а не удаляет
+    %% строку — та же логика, что архивация справочных значений. Отдельно от
+    %% витрины: initData покупателя стейтлес и не хранит серверной сессии.
+    admin_refresh_tokens {
+        bigint      id PK
+        bigint      admin_user_id FK
+        text        token_hash UK "хэш refresh-токена, не сам токен"
+        timestamptz expires_at
+        timestamptz revoked_at "NULL = активна; отзыв при logout/ротации"
+        timestamptz created_at
     }
 
     %% --- Transactional outbox (ADR-004) ---------------------------------
@@ -217,4 +231,5 @@ erDiagram
     delivery_methods  |o--o{ orders             : "способ доставки"
     payment_methods   |o--o{ orders             : "способ оплаты"
     roles             ||--o{ admin_users        : "роль"
+    admin_users       ||--o{ admin_refresh_tokens : "сессии"
 ```

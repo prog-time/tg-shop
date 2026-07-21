@@ -6,12 +6,24 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/prog-time/tg-shop/backend/internal/config"
 	"github.com/prog-time/tg-shop/backend/internal/httpx"
 	"github.com/prog-time/tg-shop/backend/internal/logging"
 )
 
+// testConfig is a minimal Auth-Module-capable config for router tests that
+// don't have a live Postgres connection (pool is passed as nil — see
+// newRouter's doc comment). The secrets are dummy values; nothing in these
+// tests exercises real cryptography against them.
+func testConfig() *config.Config {
+	return &config.Config{
+		BotToken:  "test-bot-token",
+		JWTSecret: "test-jwt-secret",
+	}
+}
+
 func TestHealthzStillReturns200(t *testing.T) {
-	r := newRouter(logging.New("error"), nil)
+	r := newRouter(logging.New("error"), nil, testConfig(), nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	rec := httptest.NewRecorder()
@@ -23,7 +35,7 @@ func TestHealthzStillReturns200(t *testing.T) {
 }
 
 func TestUnimplementedContractRouteReturns501Envelope(t *testing.T) {
-	r := newRouter(logging.New("error"), nil)
+	r := newRouter(logging.New("error"), nil, testConfig(), nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/products", nil)
 	req.Header.Set(httpx.RequestIDHeader, "test-request-id")
@@ -55,7 +67,7 @@ func TestUnimplementedContractRouteReturns501Envelope(t *testing.T) {
 }
 
 func TestUnimplementedContractRoute_AnyMethodAndDeepPath(t *testing.T) {
-	r := newRouter(logging.New("error"), nil)
+	r := newRouter(logging.New("error"), nil, testConfig(), nil)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/products/123/some/unknown/nesting", nil)
 	rec := httptest.NewRecorder()
