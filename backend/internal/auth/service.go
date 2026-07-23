@@ -126,7 +126,24 @@ func (s *Service) Refresh(ctx context.Context, rawToken string) (*TokenPair, err
 		}
 		return nil, fmt.Errorf("lookup refresh token: %w", err)
 	}
-	if record.RevokedAt != nil || !record.ExpiresAt.After(s.now()) {
+	if record.RevokedAt != nil {
+		// The token exists but was already rotated away or logged out, and
+		// someone is presenting it anyway. A well-behaved client never does
+		// this: it holds exactly one refresh token and replaces it on every
+		// refresh. So this is the signature of a stolen token being replayed
+		// — either the thief is using a copy the legitimate client already
+		// rotated past, or the legitimate client is using one the thief
+		// rotated. There is no way to tell which side is which, so the safe
+		// move is to end every session for this admin and force a fresh
+		// login. This is why revocation keeps the row (00008) instead of
+		// deleting it: a deleted row would be indistinguishable from a token
+		// that never existed, and the replay would look like ordinary noise.
+		if err := s.Repo.RevokeAllRefreshTokens(ctx, record.AdminUserID); err != nil {
+			return nil, fmt.Errorf("revoke sessions after refresh token reuse: %w", err)
+		}
+		return nil, ErrInvalidRefreshToken
+	}
+	if !record.ExpiresAt.After(s.now()) {
 		return nil, ErrInvalidRefreshToken
 	}
 

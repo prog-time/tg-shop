@@ -101,16 +101,18 @@ func scanAdmin(row pgx.Row) (*AdminRecord, error) {
 	return &a, nil
 }
 
-// GetAdminByEmail looks up a staff account by email (case-sensitive; emails
-// are normalized to lowercase at write time — out of scope here since
-// admin-user creation is a different module — so callers should lowercase
-// before calling, which Service.Login does).
+// GetAdminByEmail looks up a staff account by email, case-insensitively.
+// Callers pass an already-normalized (lowercased, trimmed) address — see
+// Service.Login — and the comparison folds the stored side too, matching the
+// unique index on lower(email) added in migration 00011. Matching on the raw
+// column instead would lock out any account whose stored address carries an
+// uppercase letter, silently and with no error to trace.
 func (r *Repo) GetAdminByEmail(ctx context.Context, email string) (*AdminRecord, error) {
 	row := r.pool.QueryRow(ctx, `
 		SELECT `+adminSelectCols+`
 		FROM admin_users au
 		JOIN roles r ON r.id = au.role_id
-		WHERE au.email = $1
+		WHERE lower(au.email) = $1
 	`, email)
 	return scanAdmin(row)
 }
@@ -144,11 +146,12 @@ func (r *Repo) InsertRefreshToken(ctx context.Context, adminUserID int64, tokenH
 	return id, nil
 }
 
-// GetActiveRefreshTokenByHash finds a non-revoked, non-expired session by
-// its token hash. It intentionally does NOT filter revoked_at/expires_at in
-// SQL (beyond what's needed for the index) so callers can distinguish
-// "doesn't exist" from "exists but revoked/expired" for logging, while still
-// returning a uniform error to the HTTP client either way.
+// GetRefreshTokenByHash finds a session row by its token hash, whatever its
+// state. It deliberately does NOT filter on revoked_at/expires_at in SQL:
+// Service.Refresh needs to tell "no such token" apart from "a token that was
+// already rotated away", because the latter is a replay and triggers
+// account-wide revocation. Both still collapse into one uniform error for
+// the HTTP client.
 func (r *Repo) GetRefreshTokenByHash(ctx context.Context, tokenHash string) (*RefreshTokenRecord, error) {
 	var t RefreshTokenRecord
 	err := r.pool.QueryRow(ctx, `

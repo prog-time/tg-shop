@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -79,6 +80,51 @@ func TestRepo_Integration(t *testing.T) {
 
 		if _, err := repo.GetAdminByEmail(ctx, "does-not-exist@example.com"); err != ErrNotFound {
 			t.Fatalf("GetAdminByEmail for missing row: err = %v, want ErrNotFound", err)
+		}
+	})
+
+	// Regression: 00002 made admin_users.email unique on the raw string while
+	// Service.Login lowercases what the user typed, so an account stored with
+	// any uppercase letter could never authenticate — the lookup missed and
+	// nothing reported why. 00011 moved uniqueness onto lower(email) and the
+	// query folds both sides.
+	t.Run("AdminByEmail_IsCaseInsensitive", func(t *testing.T) {
+		const stored = "Integration.Admin@Example.COM"
+		roleID := mustRoleID(t, ctx, pool, "admin")
+		hash, err := HashPassword("integration-test-password")
+		if err != nil {
+			t.Fatalf("HashPassword: %v", err)
+		}
+
+		var adminID int64
+		err = pool.QueryRow(ctx, `
+			INSERT INTO admin_users (email, password_hash, role_id, is_active)
+			VALUES ($1, $2, $3, true)
+			RETURNING id
+		`, stored, hash, roleID).Scan(&adminID)
+		if err != nil {
+			t.Fatalf("insert admin: %v", err)
+		}
+		t.Cleanup(func() { mustExec(t, ctx, pool, `DELETE FROM admin_users WHERE id = $1`, adminID) })
+
+		// What Service.Login actually passes down after normalizeEmail.
+		found, err := repo.GetAdminByEmail(ctx, strings.ToLower(stored))
+		if err != nil {
+			t.Fatalf("GetAdminByEmail with a normalized address: %v", err)
+		}
+		if found.ID != adminID {
+			t.Fatalf("got admin %d, want %d", found.ID, adminID)
+		}
+
+		// And the unique index must now reject a case-variant duplicate
+		// rather than letting two accounts claim the same address.
+		_, err = pool.Exec(ctx, `
+			INSERT INTO admin_users (email, password_hash, role_id, is_active)
+			VALUES ($1, $2, $3, true)
+		`, strings.ToUpper(stored), hash, roleID)
+		if err == nil {
+			mustExec(t, ctx, pool, `DELETE FROM admin_users WHERE lower(email) = lower($1) AND id <> $2`, stored, adminID)
+			t.Fatal("inserting a case-variant duplicate email must violate the unique index")
 		}
 	})
 

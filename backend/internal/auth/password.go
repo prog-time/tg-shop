@@ -69,6 +69,13 @@ func VerifyPassword(password, encoded string) (bool, error) {
 	if _, err := fmt.Sscanf(parts[2], "v=%d", &version); err != nil {
 		return false, fmt.Errorf("parse version: %w", err)
 	}
+	// A hash produced by a different argon2 version cannot be verified by
+	// this one: same inputs, different derived key. Without this check the
+	// mismatch surfaces as an ordinary "wrong password" for an account whose
+	// password is in fact correct — a lockout that looks like user error.
+	if version != argon2.Version {
+		return false, fmt.Errorf("auth: unsupported argon2 version %d (want %d)", version, argon2.Version)
+	}
 
 	var memory, iterations uint32
 	var parallelism uint8
