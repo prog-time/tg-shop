@@ -101,14 +101,43 @@ func TestService_Refresh_RotatesToken(t *testing.T) {
 		t.Fatal("expected rotation to produce a new refresh token")
 	}
 
-	// The old (now-revoked) refresh token must be rejected.
+	// The newly issued refresh token must keep working across refreshes —
+	// rotation must not cost the legitimate client its session.
+	if _, err := svc.Refresh(t.Context(), newPair.RefreshToken); err != nil {
+		t.Fatalf("Refresh with newly rotated token: %v", err)
+	}
+}
+
+// TestService_Refresh_ReuseRevokesEverySession covers the replay case: a
+// refresh token that was already rotated away is presented again. Only a
+// stolen copy behaves that way — a well-behaved client always holds exactly
+// one token — and there is no way to tell the thief's request from the
+// victim's, so every session for that admin ends and both sides must log in
+// again.
+func TestService_Refresh_ReuseRevokesEverySession(t *testing.T) {
+	store := newFakeStore()
+	seedAdmin(t, store, 1, "staff@example.com", "correct-password", "admin", true)
+	svc := newTestService(t, store)
+
+	pair, _, err := svc.Login(t.Context(), "staff@example.com", "correct-password")
+	if err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	oldRefresh := pair.RefreshToken
+
+	newPair, err := svc.Refresh(t.Context(), oldRefresh)
+	if err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+
+	// Replaying the rotated token is rejected...
 	if _, err := svc.Refresh(t.Context(), oldRefresh); !errors.Is(err, ErrInvalidRefreshToken) {
 		t.Fatalf("reusing rotated token: err = %v, want ErrInvalidRefreshToken", err)
 	}
 
-	// The newly issued refresh token must still work.
-	if _, err := svc.Refresh(t.Context(), newPair.RefreshToken); err != nil {
-		t.Fatalf("Refresh with newly rotated token: %v", err)
+	// ...and takes the session that replaced it down with it.
+	if _, err := svc.Refresh(t.Context(), newPair.RefreshToken); !errors.Is(err, ErrInvalidRefreshToken) {
+		t.Fatalf("session surviving a replay: err = %v, want ErrInvalidRefreshToken", err)
 	}
 }
 
