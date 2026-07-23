@@ -24,6 +24,17 @@ type Handlers struct {
 	Log     *slog.Logger
 }
 
+// log returns h.Log, or the default logger when it was left unset. Every
+// call site is on an error path, so a nil Log would panic precisely when
+// something has already gone wrong — turning a recoverable 500 into a lost
+// request and an unlogged cause.
+func (h *Handlers) log() *slog.Logger {
+	if h.Log != nil {
+		return h.Log
+	}
+	return slog.Default()
+}
+
 // Mount registers every Auth Module route on r, applying the middleware each
 // operation's security scheme requires (docs/api/openapi.yaml):
 //
@@ -178,7 +189,7 @@ func (h *Handlers) AdminLogin(w http.ResponseWriter, r *http.Request) {
 			httpx.WriteError(w, http.StatusUnauthorized, httpx.ErrCodeUnauthorized, "invalid email or password")
 			return
 		}
-		h.Log.Error("admin login failed", "err", err)
+		h.log().Error("admin login failed", "err", err)
 		httpx.InternalError(w, r)
 		return
 	}
@@ -207,7 +218,7 @@ func (h *Handlers) AdminRefresh(w http.ResponseWriter, r *http.Request) {
 			httpx.WriteError(w, http.StatusUnauthorized, httpx.ErrCodeUnauthorized, "invalid or expired refresh token")
 			return
 		}
-		h.Log.Error("admin refresh failed", "err", err)
+		h.log().Error("admin refresh failed", "err", err)
 		httpx.InternalError(w, r)
 		return
 	}
@@ -230,7 +241,7 @@ func (h *Handlers) AdminLogout(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.Service.Logout(r.Context(), identity.ID, req.RefreshToken); err != nil {
-		h.Log.Error("admin logout failed", "err", err)
+		h.log().Error("admin logout failed", "err", err)
 		httpx.InternalError(w, r)
 		return
 	}
@@ -252,7 +263,7 @@ func (h *Handlers) GetAdminMe(w http.ResponseWriter, r *http.Request) {
 			httpx.WriteError(w, http.StatusUnauthorized, httpx.ErrCodeUnauthorized, "invalid or expired access token")
 			return
 		}
-		h.Log.Error("admin me failed", "err", err)
+		h.log().Error("admin me failed", "err", err)
 		httpx.InternalError(w, r)
 		return
 	}
@@ -271,7 +282,7 @@ func (h *Handlers) GetMe(w http.ResponseWriter, r *http.Request) {
 
 	profile, err := h.Service.MeCustomer(r.Context(), tgUser)
 	if err != nil {
-		h.Log.Error("get me failed", "err", err)
+		h.log().Error("get me failed", "err", err)
 		httpx.InternalError(w, r)
 		return
 	}
