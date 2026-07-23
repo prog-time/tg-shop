@@ -7,6 +7,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strings"
 )
 
 // Config is the full set of settings shared by api, bot and worker. Each
@@ -76,7 +77,40 @@ func (c *Config) RequireAuth() error {
 	if c.JWTSecret == "" {
 		return fmt.Errorf("JWT_SECRET is required")
 	}
+	// Non-empty is not the bar. `.env.example` ships JWT_SECRET=change-me as
+	// a placeholder, and a deployment that copies the example verbatim would
+	// otherwise start happily — signing every staff session with a value
+	// published in this repository. Anyone could then mint an admin token.
+	// Refuse the known placeholders outright, and require enough length that
+	// a hand-typed secret cannot be brute-forced offline from a single
+	// captured token.
+	if _, placeholder := jwtSecretPlaceholders[strings.ToLower(strings.TrimSpace(c.JWTSecret))]; placeholder {
+		return fmt.Errorf("JWT_SECRET is still the example placeholder; generate one, e.g. `openssl rand -base64 48`")
+	}
+	if len(c.JWTSecret) < minJWTSecretLength {
+		return fmt.Errorf("JWT_SECRET must be at least %d characters, got %d", minJWTSecretLength, len(c.JWTSecret))
+	}
 	return nil
+}
+
+// minJWTSecretLength matches the guidance already printed next to
+// JWT_SECRET in `.env.example` ("минимум 32 случайных байта") — until now
+// nothing enforced it.
+const minJWTSecretLength = 32
+
+// jwtSecretPlaceholders are values that appear in the repository's own
+// examples and documentation, compared case-insensitively.
+var jwtSecretPlaceholders = map[string]struct{}{
+	"change-me":     {},
+	"changeme":      {},
+	"secret":        {},
+	"your-secret":   {},
+	"jwt-secret":    {},
+	"test":          {},
+	"development":   {},
+	"dev-secret":    {},
+	"supersecret":   {},
+	"changethisnow": {},
 }
 
 // EnvOr returns the value of key k, or def when unset or empty.
